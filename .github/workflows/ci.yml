@@ -1,0 +1,121 @@
+name: Forwarding regression tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build relay
+        run: gcc -O2 -pthread -Wall -Wextra -Wshadow -Wformat=2 -o /tmp/tcp_pool tcp_pool.c
+      - name: Version feature probe
+        run: /tmp/tcp_pool --version | grep -q "enable_tcp" && /tmp/tcp_pool --version | grep -q "rate_limit"
+      - name: Fault injection with sanitizers
+        run: python3 tests/test_forwarding.py
+      - name: Real TCP backpressure and half-close tests
+        run: python3 tests/test_linux.py
+      - name: relays.conf parser regression (incl. ENABLE_TCP/UDP)
+        run: |
+          awk '/^cat > \/usr\/local\/bin\/tcp-pool-parse <<.EOF.$/{flag=1;next}/^EOF$/{if(flag){flag=0}}flag' install.sh > /tmp/tcp-pool-parse
+          chmod +x /tmp/tcp-pool-parse
+          mkdir -p /tmp/tp && cat > /tmp/tp/relays.conf <<'CONF'
+          [HK]
+          LOCAL_IP=0.0.0.0
+          LOCAL_PORT=30000
+          REMOTE_IP=1.2.3.4
+          REMOTE_TCP_PORT=443
+          REMOTE_UDP_PORT=443
+          ENABLE_TCP=1
+          ENABLE_UDP=0
+          POOL_SIZE=16
+
+          [V6UDP]
+          LOCAL_IP=::
+          LOCAL_PORT=30001
+          REMOTE_IP=example.com
+          REMOTE_TCP_PORT=8443
+          REMOTE_UDP_PORT=8443
+          ENABLE_TCP=0
+          ENABLE_UDP=1
+          CONF
+          sed -i 's|SRC="/etc/tcp_pool/relays.conf"|SRC="/tmp/tp/relays.conf"|; s|DST="/etc/tcp_pool"|DST="/tmp/tp"|' /tmp/tcp-pool-parse
+          bash /tmp/tcp-pool-parse
+          grep -q '^ENABLE_TCP=1$' /tmp/tp/HK.conf
+          grep -q '^ENABLE_UDP=0$' /tmp/tp/HK.conf
+          grep -q '^ENABLE_UDP=1$' /tmp/tp/V6UDP.conf
+          grep -q '^ENABLE_TCP=1$' /tmp/tp/V6UDP.conf
+          echo "parser regression passed"
+
+  panel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: panel/go.mod
+      - name: Vet and build panel
+        run: |
+          cd panel
+          go vet ./...
+          go build ./...
+
+  dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf file
+      - uses: mlugg/setup-zig@v1
+        with:
+          zig-version: 0.13.0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: panel/go.mod
+      - name: Build all artifacts
+        run: |
+          ./build-release.sh dist
+          aarch64-linux-gnu-gcc -O2 -pthread -Wall -Wextra -Wshadow -Wformat=2 -o dist/tcp_pool-linux-arm64 tcp_pool.c
+          arm-linux-gnueabihf-gcc -O2 -pthread -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard -Wall -Wextra -Wshadow -Wformat=2 -o dist/tcp_pool-linux-armv7 tcp_pool.c
+          # musl 静态版 tcp_pool（Alpine 兼容）→ 内嵌进单文件客户端
+          mkdir -p panel/bin
+          zig cc -target x86_64-linux-musl -O2 -pthread -Wall -Wextra -Wshadow -Wformat=2 -o dist/tcp_pool-linux-amd64-musl tcp_pool.c
+          zig cc -target aarch64-linux-musl -O2 -pthread -Wall -Wextra -Wshadow -Wformat=2 -o dist/tcp_pool-linux-arm64-musl tcp_pool.c
+          cp dist/tcp_pool-linux-amd64-musl panel/bin/
+          cp dist/tcp_pool-linux-arm64-musl panel/bin/
+          # 单文件客户端（Go 静态 + 内嵌 musl tcp_pool）
+          cd panel
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_tcpool -trimpath -ldflags="-s -w" -o ../dist/relay-panel-client-linux-amd64 .
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags embed_tcpool -trimpath -ldflags="-s -w" -o ../dist/relay-panel-client-linux-arm64 .
+          cd ..
+          chmod +x dist/*
+      - name: Verify static linking
+        run: |
+          file dist/tcp_pool-linux-*-musl dist/relay-panel-client-linux-* | tee /tmp/file.txt
+          grep -c "statically linked" /tmp/file.txt >= 5 || (echo "存在非静态产物" && exit 1)
+      - name: Alpine smoke test (amd64 client)
+        run: |
+          docker run --rm -v "$PWD/dist:/d" alpine:latest /d/relay-panel-client-linux-amd64 -version
+          docker run --rm -v "$PWD/dist:/d" alpine:latest /d/tcp_pool-linux-amd64-musl --version | grep -q enable_tcp
+      - name: Upload release assets
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-binaries
+          path: dist/*
