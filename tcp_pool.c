@@ -81,6 +81,13 @@ static int cfg_tcp_keepidle = 360;
 static int cfg_tcp_keepintvl = 15;
 static int cfg_tcp_keepcnt = 1;
 static int cfg_tcp_user_timeout_ms = 0;
+static bool cfg_enable_tcp = true; //面板按规则启用/禁用 TCP 转发
+static bool cfg_enable_udp = true; //面板按规则启用/禁用 UDP 转发
+static int cfg_stats_interval = 30; //统计文件写入周期（秒），0关闭
+static int cfg_rate_limit_kbps = 0; //实例级限速（KB/s，双向各自限制），0不限
+static char *cfg_stats_file = NULL; //统计JSON输出文件
+
+#define TCP_POOL_VERSION "v1.7"
 
 typedef struct LogNode {
     char *msg;
@@ -283,6 +290,11 @@ static void load_runtime_config(void) {
     cfg_tcp_keepintvl = parse_env_int("TCP_KEEPINTVL", 15, 1, 3600);
     cfg_tcp_keepcnt = parse_env_int("TCP_KEEPCNT", 1, 1, 30);
     cfg_tcp_user_timeout_ms = parse_env_int("TCP_USER_TIMEOUT_MS", 0, 0, 3600000);
+    cfg_enable_tcp = parse_env_bool("ENABLE_TCP", true);
+    cfg_enable_udp = parse_env_bool("ENABLE_UDP", true);
+    cfg_stats_interval = parse_env_int("STATS_INTERVAL", 30, 0, 3600);
+    cfg_rate_limit_kbps = parse_env_int("RATE_LIMIT_KBPS", 0, 0, 10000000);
+    cfg_stats_file = getenv("STATS_FILE");
     LOG_ENABLE = parse_env_bool("LOG_ENABLE", true);
 }
 
@@ -534,9 +546,32 @@ typedef struct Conn {
 static int epfd;
 static Conn *conn_list = NULL;
 
+//流量统计与实例级限速。仅主循环线程访问；g_rate_kbps==0 时行为与原版一致。
+//定义需位于 conn_watch/pump 之前，且与它们同处一段（tests/test_forwarding.py 按段提取编译，
+//部分计数器只在提取段之外引用，用 unused 属性避免 -Werror -Wunused-variable）。
+#if defined(__GNUC__)
+#define COUNTER_VAR __attribute__((unused))
+#else
+#define COUNTER_VAR
+#endif
+static COUNTER_VAR uint64_t g_bytes_up;        //客户端->远端累计（TCP，源端读取时计数）
+static COUNTER_VAR uint64_t g_bytes_down;      //远端->客户端累计（TCP）
+static COUNTER_VAR uint64_t g_udp_bytes_up;    //客户端->远端累计（UDP）
+static COUNTER_VAR uint64_t g_udp_bytes_down;  //远端->客户端累计（UDP）
+static COUNTER_VAR uint64_t g_conn_total;      //历史接入TCP连接数
+static int      g_conns_active;    //当前活跃TCP连接（conn_close 引用）
+static COUNTER_VAR int      g_udp_sessions;    //当前UDP会话数
+static COUNTER_VAR uint64_t g_udp_total;       //历史UDP会话数
+static int64_t  g_rate_kbps;       //限速KB/s，main按配置填充，0=不限
+static int64_t  g_tokens_up;       //当前周期可搬运字节（l2r）
+static int64_t  g_tokens_down;     //当前周期可搬运字节（r2l）
+static int64_t *g_pump_tokens;     //本次pump方向的令牌桶
+static uint64_t *g_pump_bytes;     //本次pump方向的字节计数
+
 static void conn_close(Conn *c) {//关闭连接
     if (!c || c->closed) return;
     c->closed = true;
+    if (g_conns_active > 0) g_conns_active--;
 
     if (c->fd_l >= 0) { epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd_l, NULL); safe_close(&c->fd_l); }
     if (c->fd_r >= 0) { epoll_ctl(epfd, EPOLL_CTL_DEL, c->fd_r, NULL); safe_close(&c->fd_r); }
@@ -554,10 +589,13 @@ static void conn_watch(Conn *c) {
     if (c->connecting) {
         ev_r |= EPOLLOUT | EPOLLRDHUP;
     } else {
+        //限速令牌耗尽的方向不注册读事件，主循环每秒补充令牌后会重新触发
+        bool can_read_l = (g_rate_kbps == 0 || g_tokens_up > 0);
+        bool can_read_r = (g_rate_kbps == 0 || g_tokens_down > 0);
         //有积压时只等待目标可写。实际pipe容量可能远小于cfg_splice_chunk，
         //而且splice可能耗尽pipe buffer槽位，不能用字节数推断剩余容量。
-        if (!c->eof_l2r && c->len_l2r == 0) ev_l |= EPOLLIN | EPOLLRDHUP;
-        if (!c->eof_r2l && c->len_r2l == 0) ev_r |= EPOLLIN | EPOLLRDHUP;
+        if (can_read_l && !c->eof_l2r && c->len_l2r == 0) ev_l |= EPOLLIN | EPOLLRDHUP;
+        if (can_read_r && !c->eof_r2l && c->len_r2l == 0) ev_r |= EPOLLIN | EPOLLRDHUP;
         if (c->len_l2r > 0) ev_r |= EPOLLOUT;
         if (c->len_r2l > 0) ev_l |= EPOLLOUT;
     }
@@ -607,11 +645,20 @@ static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,
         //不能依赖无条件MOD，否则修复空转后可能遗漏尚未读完的ET事件。
         if (moved >= cfg_splice_chunk) return PUMP_MORE;
 
-        ssize_t n = splice(src_fd, NULL, pipe_in, NULL, cfg_splice_chunk - moved,
+        //限速：本方向令牌耗尽时停止读取（不返回PUMP_MORE避免事件风暴），
+        //由主循环每秒补充令牌后重新注册读事件。
+        if (g_pump_tokens && *g_pump_tokens <= 0) return PUMP_OK;
+
+        size_t want = cfg_splice_chunk - moved;
+        if (g_pump_tokens && (int64_t)want > *g_pump_tokens) want = (size_t)*g_pump_tokens;
+
+        ssize_t n = splice(src_fd, NULL, pipe_in, NULL, want,
                            SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (n > 0) {
             *pipe_len += (size_t)n;
             moved += (size_t)n;
+            if (g_pump_tokens) *g_pump_tokens -= (int64_t)n;
+            if (g_pump_bytes) *g_pump_bytes += (uint64_t)n;
             *last_ts = now_ms;
             continue;
         }
@@ -707,6 +754,8 @@ static UdpAssoc* udp_get_or_create(const struct sockaddr_storage *cli,
 
     n->next = udp_tab[idx];
     udp_tab[idx] = n;
+    g_udp_sessions++;
+    g_udp_total++;
     return n;
 }
 
@@ -721,11 +770,62 @@ static void udp_remove(UdpAssoc *u, uint32_t idx, int epfd_) {
         pp = &(*pp)->next;
     }
     free(u);
+    if (g_udp_sessions > 0) g_udp_sessions--;
 }
 
-int main() {
+//把统计快照写到 STATS_FILE（临时文件+rename，读者永远看到完整JSON）
+static void write_stats_file(void) {
+    if (!cfg_stats_file || !*cfg_stats_file || cfg_stats_interval <= 0) return;
+
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", cfg_stats_file);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f,
+        "{\"up\":%llu,\"down\":%llu,\"conns\":%d,\"conns_total\":%llu,"
+        "\"udp\":%d,\"udp_total\":%llu,\"rate_kbps\":%lld,\"t\":%llu}\n",
+        (unsigned long long)(g_bytes_up + g_udp_bytes_up),
+        (unsigned long long)(g_bytes_down + g_udp_bytes_down),
+        g_conns_active,
+        (unsigned long long)g_conn_total,
+        g_udp_sessions,
+        (unsigned long long)g_udp_total,
+        (long long)g_rate_kbps,
+        (unsigned long long)time(NULL));
+    fclose(f);
+    if (rename(tmp, cfg_stats_file) != 0) remove(tmp);
+}
+
+//确保 STATS_FILE 的父目录存在（只创建一层，如 /run/tcp-pool）
+static void ensure_stats_dir(void) {
+    if (!cfg_stats_file || !*cfg_stats_file) return;
+    char *dir = strdup(cfg_stats_file);
+    if (!dir) return;
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) {
+        *slash = '\0';
+        mkdir(dir, 0755); //已存在时失败可以忽略
+    }
+    free(dir);
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+        printf("tcp_pool %s (features: enable_tcp, enable_udp, stats, rate_limit)\n", TCP_POOL_VERSION);
+        return 0;
+    }
+
     char *env;
     load_runtime_config();
+    g_rate_kbps = (int64_t)cfg_rate_limit_kbps;
+    if (g_rate_kbps > 0) {
+        g_tokens_up = g_tokens_down = g_rate_kbps * 1024; //开局满令牌
+    }
+
+    if (!cfg_enable_tcp && !cfg_enable_udp) {
+        fprintf(stderr, "ERROR: ENABLE_TCP and ENABLE_UDP are both off\n");
+        exit(1);
+    }
 
     LOCAL_IP = getenv("LOCAL_IP");
     if (!LOCAL_IP) {
@@ -744,33 +844,40 @@ int main() {
         exit(1);
     }
     env = getenv("REMOTE_TCP_PORT");
-    if (!env) {
+    if (env && *env) REMOTE_TCP_PORT = atoi(env);
+    if (cfg_enable_tcp && REMOTE_TCP_PORT <= 0) {
         fprintf(stderr, "ERROR: REMOTE_TCP_PORT not set\n");
         exit(1);
     }
-    REMOTE_TCP_PORT = atoi(env);
     env = getenv("REMOTE_UDP_PORT");
-    if (!env) {
+    if (env && *env) REMOTE_UDP_PORT = atoi(env);
+    if (cfg_enable_udp && REMOTE_UDP_PORT <= 0) REMOTE_UDP_PORT = REMOTE_TCP_PORT; //UDP端口缺省跟随TCP端口
+    if (cfg_enable_udp && REMOTE_UDP_PORT <= 0) {
         fprintf(stderr, "ERROR: REMOTE_UDP_PORT not set\n");
         exit(1);
     }
-    REMOTE_UDP_PORT = atoi(env);
-    printf("Using config: %s:%d -> %d/%d\n",
-       REMOTE_IP, REMOTE_TCP_PORT, REMOTE_TCP_PORT, REMOTE_UDP_PORT);
-    printf("Runtime: pool=%d refill=%d splice=%zu backlog=%d udp_buf=%d log=%s\n",
+    printf("Using config: %s:%d -> %s [%s] %d/%d\n",
+       REMOTE_IP, LOCAL_PORT, LOCAL_IP,
+       cfg_enable_tcp && cfg_enable_udp ? "tcp+udp" : (cfg_enable_tcp ? "tcp" : "udp"),
+       REMOTE_TCP_PORT, REMOTE_UDP_PORT);
+    printf("Runtime: pool=%d refill=%d splice=%zu backlog=%d udp_buf=%d rate=%dKB/s stats=%ds log=%s\n",
            cfg_pool_size, cfg_refill_batch, cfg_splice_chunk, cfg_listen_backlog,
-           cfg_udp_socket_buffer, LOG_ENABLE ? "on" : "off");
-    if (resolve_addr(LOCAL_IP, LOCAL_PORT, SOCK_STREAM, &local_bind_addr, &local_bind_addrlen) != 0) {
+           cfg_udp_socket_buffer, cfg_rate_limit_kbps, cfg_stats_interval, LOG_ENABLE ? "on" : "off");
+    if (resolve_addr(LOCAL_IP, LOCAL_PORT,
+                     cfg_enable_tcp ? SOCK_STREAM : SOCK_DGRAM,
+                     &local_bind_addr, &local_bind_addrlen) != 0) {
         fprintf(stderr, "ERROR: resolve LOCAL_IP failed: %s:%d\n", LOCAL_IP, LOCAL_PORT);
         exit(1);
     }
 
-    if (resolve_addr(REMOTE_IP, REMOTE_TCP_PORT, SOCK_STREAM, &remote_tcp_addr, &remote_tcp_addrlen) != 0) {
+    if (cfg_enable_tcp &&
+        resolve_addr(REMOTE_IP, REMOTE_TCP_PORT, SOCK_STREAM, &remote_tcp_addr, &remote_tcp_addrlen) != 0) {
         fprintf(stderr, "ERROR: resolve REMOTE_TCP failed: %s:%d\n", REMOTE_IP, REMOTE_TCP_PORT);
         exit(1);
     }
 
-    if (resolve_addr(REMOTE_IP, REMOTE_UDP_PORT, SOCK_DGRAM, &remote_udp_addr, &remote_udp_addrlen) != 0) {
+    if (cfg_enable_udp &&
+        resolve_addr(REMOTE_IP, REMOTE_UDP_PORT, SOCK_DGRAM, &remote_udp_addr, &remote_udp_addrlen) != 0) {
         fprintf(stderr, "ERROR: resolve REMOTE_UDP failed: %s:%d\n", REMOTE_IP, REMOTE_UDP_PORT);
         exit(1);
     }
@@ -778,7 +885,7 @@ int main() {
     (void)setrlimit(RLIMIT_NOFILE, &r);
     signal(SIGPIPE, SIG_IGN);
 
-    if (cfg_pool_size > 0) {
+    if (cfg_enable_tcp && cfg_pool_size > 0) {
         pthread_t t_m;
         pthread_create(&t_m, NULL, thread_maintain, NULL);
         pthread_detach(t_m);
@@ -787,47 +894,56 @@ int main() {
     epfd = epoll_create1(0);
     if (epfd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
 
-    int listen_fd = socket(((struct sockaddr*)&local_bind_addr)->sa_family, SOCK_STREAM, 0);//tcp监听
-    if (listen_fd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
+    int listen_fd = -1;
+    if (cfg_enable_tcp) {//tcp监听
+        listen_fd = socket(((struct sockaddr*)&local_bind_addr)->sa_family, SOCK_STREAM, 0);
+        if (listen_fd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
 
-    set_common_socket_options(listen_fd);
-    if (set_nonblock(listen_fd) != 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
+        set_common_socket_options(listen_fd);
+        if (set_nonblock(listen_fd) != 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
 
-    if (bind(listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0 || listen(listen_fd, cfg_listen_backlog) < 0) {
-        log_enqueue("socket listen failed");
-        log_flush_all_force();
-        return 1;
+        if (bind(listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0 || listen(listen_fd, cfg_listen_backlog) < 0) {
+            log_enqueue("socket listen failed");
+            log_flush_all_force();
+            return 1;
+        }
+
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.ptr = NULL;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev) != 0) {
+            log_enqueue("socket listen failed");
+            log_flush_all_force();
+            return 1;
+        }
     }
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = NULL;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev) != 0) {
-        log_enqueue("socket listen failed");
-        log_flush_all_force();
-        return 1;
-    }
+    if (cfg_enable_udp) {
+        udp_listen_fd = socket(((struct sockaddr*)&local_bind_addr)->sa_family, SOCK_DGRAM, 0);
+        if (udp_listen_fd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
+        set_udp_socket_options(udp_listen_fd);
+        set_common_socket_options(udp_listen_fd);
+        if (set_nonblock(udp_listen_fd) != 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
+        if (bind(udp_listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0) {
+            log_enqueue("socket listen failed");
+            log_flush_all_force();
+            return 1;
+        }
 
-    udp_listen_fd = socket(((struct sockaddr*)&local_bind_addr)->sa_family, SOCK_DGRAM, 0);
-    if (udp_listen_fd < 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
-    set_udp_socket_options(udp_listen_fd);
-    set_common_socket_options(udp_listen_fd);
-    if (set_nonblock(udp_listen_fd) != 0) { log_enqueue("socket listen failed"); log_flush_all_force(); return 1; }
-    if (bind(udp_listen_fd, (struct sockaddr*)&local_bind_addr, local_bind_addrlen) < 0) {
-        log_enqueue("socket listen failed");
-        log_flush_all_force();
-        return 1;
-    }
-
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = TAG_UDP_LISTEN;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, udp_listen_fd, &ev) != 0) {
-        log_enqueue("socket listen failed");
-        log_flush_all_force();
-        return 1;
+        struct epoll_event ev;
+        ev.events = EPOLLIN | EPOLLET;
+        ev.data.ptr = TAG_UDP_LISTEN;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, udp_listen_fd, &ev) != 0) {
+            log_enqueue("socket listen failed");
+            log_flush_all_force();
+            return 1;
+        }
     }
 
     struct epoll_event events[EPOLL_EVENTS_MAX];
+
+    ensure_stats_dir();
+    write_stats_file(); //启动即写一份，面板无需等首个周期
 
     while (1) {
         int nfds = epoll_wait(epfd, events, EPOLL_EVENTS_MAX, 100);
@@ -887,6 +1003,8 @@ int main() {
                     c->pipe_r2l[0] = c->pipe_r2l[1] = -1;
                     c->last_l2r = c->last_r2l = now;
                     c->half_close_since = 0;
+                    g_conn_total++;
+                    g_conns_active++;
 
                     if (pipe2(c->pipe_l2r, O_NONBLOCK) != 0 || pipe2(c->pipe_r2l, O_NONBLOCK) != 0) {
                         conn_close(c);
@@ -923,6 +1041,7 @@ int main() {
 
                     UdpAssoc *u = udp_get_or_create(&cli, clen, now, epfd);
                     if (!u) continue;
+                    g_udp_bytes_up += (uint64_t)n;
 
                     ssize_t s = send(u->up_fd, buf, (size_t)n, MSG_DONTWAIT);
                     (void)s; // UDP发送失败直接丢包，避免阻塞
@@ -949,6 +1068,7 @@ int main() {
                     ssize_t s = sendto(udp_listen_fd, buf, (size_t)n, MSG_DONTWAIT,
                                        (struct sockaddr*)&u->cli, u->cli_len);
                     (void)s;
+                    if (n > 0) g_udp_bytes_down += (uint64_t)n;
                     u->last_act = now;
                 }
                 continue;
@@ -990,6 +1110,8 @@ int main() {
             pump_status_t st1 = PUMP_OK, st2 = PUMP_OK;
 
             if (!c->eof_l2r) {
+                g_pump_tokens = &g_tokens_up;
+                g_pump_bytes = &g_bytes_up;
                 st1 = pump(c->fd_l, c->fd_r, c->pipe_l2r[1], c->pipe_l2r[0],
                            &c->len_l2r, now, &c->last_l2r);
                 if (st1 == PUMP_ERR) {
@@ -1025,6 +1147,8 @@ int main() {
             }
 
             if (!c->eof_r2l) {
+                g_pump_tokens = &g_tokens_down;
+                g_pump_bytes = &g_bytes_down;
                 st2 = pump(c->fd_r, c->fd_l, c->pipe_r2l[1], c->pipe_r2l[0],
                            &c->len_r2l, now, &c->last_r2l);
                 if (st2 == PUMP_ERR) {
@@ -1075,6 +1199,18 @@ int main() {
         if (now - last_clean > 1000) {
             last_clean = now;
 
+            //限速令牌按秒补充（允许积攒1秒突发），随后重新注册因限速摘掉的读事件。
+            //令牌耗尽时两个方向都可能没有事件源，必须主动重挂，否则连接会卡死。
+            if (g_rate_kbps > 0) {
+                int64_t refill = g_rate_kbps * 1024;
+                g_tokens_up = (g_tokens_up + refill > refill) ? refill : g_tokens_up + refill;
+                g_tokens_down = (g_tokens_down + refill > refill) ? refill : g_tokens_down + refill;
+                for (Conn *rc = conn_list; rc; rc = rc->next) {
+                    rc->repoll_l = rc->repoll_r = true;
+                    conn_watch(rc);
+                }
+            }
+
             Conn *prev = NULL, *cur = conn_list;
             while (cur) {
                 Conn *next = cur->next;
@@ -1123,6 +1259,15 @@ int main() {
                     }
                     p = nxt;
                 }
+            }
+        }
+
+        //按配置周期写统计快照
+        if (cfg_stats_interval > 0) {
+            static uint64_t last_stats = 0;
+            if (now - last_stats > (uint64_t)cfg_stats_interval * 1000ULL) {
+                last_stats = now;
+                write_stats_file();
             }
         }
     }
