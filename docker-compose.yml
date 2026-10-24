@@ -1,0 +1,17 @@
+services:
+  relay-panel:
+    build: .
+    image: relay-panel:latest
+    container_name: relay-panel
+    ports:
+      - "8081:8081"          # 页面 / 面板 API / 节点轮询共用这一个端口
+    volumes:
+      - panel-data:/etc/relay-panel   # 状态/用户/规则/TLS 证书持久化
+    environment:
+      - PANEL_TLS=0                  # 套 CF/反代时保持 0（反代终止 TLS）；裸跑直连改 1
+      - PANEL_ADMIN_PASSWORD=changeme  # 首次启动的 admin 密码
+      # - PANEL_ADDR=:8081
+    restart: unless-stopped
+
+volumes:
+  panel-data:

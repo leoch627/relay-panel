@@ -286,6 +286,8 @@ func main() {
 		}
 	}
 	api.traffic = StartTrafficCollector(store, filepath.Dir(paths.StateFile), sampleInterval)
+	// 定期测活（主控侧，60s 周期；远端规则另有节点侧探测）
+	api.prober = StartProber(store, *dryRun, 60*time.Second)
 	mux := http.NewServeMux()
 	api.Register(mux)
 

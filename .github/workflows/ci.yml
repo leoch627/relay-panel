@@ -55,9 +55,14 @@ jobs:
 
   panel:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build frontend (React + shadcn/ui)
+        run: cd panel/frontend && npm install --no-audit --no-fund && npm run typecheck && npm run build
       - uses: actions/setup-go@v5
         with:
           go-version-file: panel/go.mod
@@ -82,6 +87,9 @@ jobs:
       - uses: mlugg/setup-zig@v1
         with:
           zig-version: 0.13.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
       - uses: actions/setup-go@v5
         with:
           go-version-file: panel/go.mod

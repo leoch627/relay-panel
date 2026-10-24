@@ -65,12 +65,13 @@ func (a *API) handleNodeReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Machine       MachineInfo           `json:"machine"`
-		TCPoolVersion string                `json:"tcp_pool_version"`
-		PanelVersion  string                `json:"panel_version"`
-		Statuses      map[string]UnitStatus `json:"statuses"`
-		Stats         map[string]*RuleStats `json:"stats"`
-		Error         string                `json:"error"`
+		Machine       MachineInfo             `json:"machine"`
+		TCPoolVersion string                  `json:"tcp_pool_version"`
+		PanelVersion  string                  `json:"panel_version"`
+		Statuses      map[string]UnitStatus   `json:"statuses"`
+		Stats         map[string]*RuleStats   `json:"stats"`
+		Probes        map[string]*ProbeResult `json:"probes"`
+		Error         string                  `json:"error"`
 	}
 	if err := readBody(r, &req); err != nil {
 		errJSON(w, 400, "请求格式错误")
@@ -89,6 +90,7 @@ func (a *API) handleNodeReport(w http.ResponseWriter, r *http.Request) {
 		PanelVersion:  req.PanelVersion,
 		Statuses:      req.Statuses,
 		Stats:         req.Stats,
+		Probes:        req.Probes,
 		Error:         req.Error,
 	}
 	if rep.Statuses == nil {

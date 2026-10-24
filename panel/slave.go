@@ -248,6 +248,39 @@ func (s *Slave) enforceQuotas(pr *pullResponse) map[string]*RuleStats {
 	return stats
 }
 
+// probeRemotes 节点侧定期测活：对本节点规则 TCP 建连远端测时延。
+func (s *Slave) probeRemotes(pr *pullResponse) map[string]*ProbeResult {
+	probes := map[string]*ProbeResult{}
+	for _, r := range pr.Rules {
+		parts := strings.SplitN(r.Env, "\n", -1)
+		host, tcpPort, udpPort := "", 0, 0
+		for _, line := range parts {
+			kv := strings.SplitN(line, "=", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			switch kv[0] {
+			case "REMOTE_IP":
+				host = kv[1]
+			case "REMOTE_TCP_PORT":
+				fmt.Sscanf(kv[1], "%d", &tcpPort)
+			case "REMOTE_UDP_PORT":
+				fmt.Sscanf(kv[1], "%d", &udpPort)
+			}
+		}
+		port, soft := 0, false
+		if tcpPort > 0 {
+			port = tcpPort
+		} else if udpPort > 0 {
+			port, soft = udpPort, true
+		} else {
+			continue
+		}
+		probes[r.Tag] = probeOne(host, port, soft)
+	}
+	return probes
+}
+
 func (s *Slave) Run() {
 	if err := s.EnsureEmbeddedTCPPool(); err != nil {
 		log.Printf("[slave] %v", err)
@@ -283,13 +316,14 @@ func (s *Slave) Run() {
 					}
 				}
 			}
-			// 上报状态与流量统计
+			// 上报状态、流量统计与节点侧测活结果
 			report := map[string]any{
 				"machine":          ReadMachineInfo(),
 				"tcp_pool_version": tcpVer,
 				"panel_version":    panelVersion,
 				"statuses":         s.collectStatuses(&pr),
 				"stats":            s.enforceQuotas(&pr),
+				"probes":           s.probeRemotes(&pr),
 				"error":            "",
 			}
 			if rerr := s.request("POST", "/api/node/report", report, nil); rerr != nil {

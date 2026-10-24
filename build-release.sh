@@ -4,6 +4,14 @@ set -euo pipefail
 out_dir="${1:-dist}"
 mkdir -p "$out_dir"
 
+# ---------- 前端（React + shadcn/ui，产物输出 panel/web） ----------
+if command -v npm >/dev/null 2>&1 && [ -f panel/frontend/package.json ]; then
+    echo "==> 构建前端 ..."
+    (cd panel/frontend && { [ -d node_modules ] || npm install --no-audit --no-fund; } && npm run build)
+else
+    echo "!! 跳过前端构建（无 npm），沿用已提交的 panel/web 产物" >&2
+fi
+
 # ---------- 面板（Go，全部架构交叉编译，无 CGO 依赖） ----------
 if command -v go >/dev/null 2>&1 && [ -f panel/main.go ]; then
     echo "==> 构建 relay-panel ..."

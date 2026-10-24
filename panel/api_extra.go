@@ -165,7 +165,8 @@ func (a *API) handleRulesImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Rules []ruleDTO `json:"rules"`
+		Rules  []ruleDTO `json:"rules"`
+		NodeID int64     `json:"node_id"` //批量添加/导入的目标节点（0=本机）
 	}
 	if err := readBody(r, &req); err != nil {
 		errJSON(w, 400, "请求格式错误")
@@ -179,8 +180,8 @@ func (a *API) handleRulesImport(w http.ResponseWriter, r *http.Request) {
 			skipped++ //已存在跳过，不覆盖线上配置
 			continue
 		}
-		//导入的规则归属当前管理员
-		dto.NodeID = 0 //节点依赖环境，导入一律落到本机，可再编辑迁移
+		//导入的规则归属当前管理员；目标节点可选
+		dto.NodeID = req.NodeID
 		w2 := &dummyWriter{code: 200}
 		rl := a.validateRule(w2, &dto, "")
 		if w2.code != 200 || rl == nil {

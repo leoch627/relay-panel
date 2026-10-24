@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,7 @@ type API struct {
 	sessions *SessionCache
 	tls      *TLSConfig
 	traffic  *TrafficCollector
+	prober   *Prober
 }
 
 func (a *API) tlsFingerprint() string {
@@ -153,12 +155,15 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	a.sessions.mu.Lock()
 	a.sessions.cache[token] = u
 	a.sessions.mu.Unlock()
+	//反代/CDN 场景：直连 TLS 或 X-Forwarded-Proto=https 时标记 Secure
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 	http.SetCookie(w, &http.Cookie{
 		Name:     "panel_session",
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
 		MaxAge:   7 * 24 * 3600,
 	})
 	writeJSON(w, 200, map[string]any{"user": publicUser(u)})
@@ -286,11 +291,12 @@ func (a *API) handleRulesList(w http.ResponseWriter, r *http.Request) {
 	rules := a.store.ListRules(u.ID, u.IsAdmin)
 	type row struct {
 		Rule
-		Status   UnitStatus `json:"status"`
-		Stats    *RuleStats `json:"stats"`
-		Owner    string     `json:"owner"`
-		NodeName string     `json:"node_name"`
-		MyRule   bool       `json:"my_rule"`
+		Status   UnitStatus   `json:"status"`
+		Stats    *RuleStats   `json:"stats"`
+		Probe    *ProbeResult `json:"probe"`
+		Owner    string       `json:"owner"`
+		NodeName string       `json:"node_name"`
+		MyRule   bool         `json:"my_rule"`
 	}
 	// 远端规则状态来自节点最近一次上报
 	nodeReports := map[int64]*NodeReport{}
@@ -334,10 +340,21 @@ func (a *API) handleRulesList(w http.ResponseWriter, r *http.Request) {
 		if rl.OverQuota {
 			stats.OverQuota = true
 		}
+		//定期测活：远端规则优先节点侧探测结果，本地规则用主控侧
+		var probe *ProbeResult
+		if rl.NodeID != 0 {
+			if rep, ok := nodeReports[rl.NodeID]; ok && rep.Probes != nil {
+				probe = rep.Probes[rl.Tag]
+			}
+		}
+		if probe == nil && a.prober != nil {
+			probe = a.prober.Get(rl.Tag)
+		}
 		rows = append(rows, row{
 			Rule:     *rl,
 			Status:   st,
 			Stats:    stats,
+			Probe:    probe,
 			Owner:    ownerUsername(owner),
 			NodeName: nodeName,
 			MyRule:   rl.OwnerID == u.ID,

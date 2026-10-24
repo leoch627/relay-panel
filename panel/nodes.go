@@ -21,13 +21,14 @@ type Node struct {
 
 // NodeReport 被控节点上报的内容，主控据此展示节点与远端规则状态。
 type NodeReport struct {
-	At            time.Time             `json:"at"`
-	Machine       MachineInfo           `json:"machine"`
-	TCPoolVersion string                `json:"tcp_pool_version"`
-	PanelVersion  string                `json:"panel_version"`
-	Statuses      map[string]UnitStatus `json:"statuses"`
-	Stats         map[string]*RuleStats `json:"stats,omitempty"`
-	Error         string                `json:"error,omitempty"`
+	At            time.Time               `json:"at"`
+	Machine       MachineInfo             `json:"machine"`
+	TCPoolVersion string                  `json:"tcp_pool_version"`
+	PanelVersion  string                  `json:"panel_version"`
+	Statuses      map[string]UnitStatus   `json:"statuses"`
+	Stats         map[string]*RuleStats   `json:"stats,omitempty"`
+	Probes        map[string]*ProbeResult `json:"probes,omitempty"` //节点侧定期测活
+	Error         string                  `json:"error,omitempty"`
 }
 
 // ---------- store：nodes ----------
