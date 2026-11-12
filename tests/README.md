@@ -4,6 +4,7 @@
 
 ```bash
 python3 tests/test_forwarding.py
+python3 tests/test_udp.py
 python3 tests/test_linux.py
 ```
 
@@ -27,3 +28,17 @@ python3 tests/test_linux.py /path/to/original/tcp_pool.c
 故障注入测试的部分断言约束修复后的调度行为，不能把原版的失败数量等同于独立故障数量。
 GitHub Actions 会构建程序并运行上述两组测试。测试源码修复时应自行编译，
 仓库 `dist/` 中的既有二进制不包含尚未重新构建的源码修改。
+
+`test_udp.py` 在 macOS/Linux 上使用生产 UDP 处理代码和真实回环套接字，验证空数据报、大数据报、多客户端隔离、双向限速及统计；epoll 注册在此测试中被替代。`test_linux.py` 另外验证完整进程的 TCP-only、UDP-only、双协议和双向限速。
+
+后端回归测试使用临时状态目录及 systemctl 替身，不触碰已安装服务：
+
+```bash
+go test -C panel -race ./...
+```
+
+安装器回归测试提取脚本中的安装函数，在临时目录运行并模拟 systemctl，验证原子替换、失败清理，以及升级时仅刷新仍在运行的原有实例：
+
+```bash
+python3 tests/test_panel_install.py
+```

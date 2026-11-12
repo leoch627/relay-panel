@@ -5,6 +5,7 @@ Run on an idle test machine: python3 tests/test_linux.py [path/to/tcp_pool.c]
 Uses loopback ephemeral ports. Does not restart or alter an installed service.
 """
 import concurrent.futures
+import json
 import os
 from pathlib import Path
 import shlex
@@ -75,14 +76,16 @@ def assert_idle(process, label):
     assert process.poll() is None
 
 
-def start_relay(binary, upstream):
+def start_relay(binary, upstream, **overrides):
     with listener() as reservation:
         port = reservation.getsockname()[1]
     env = os.environ.copy()
     env.update(LOCAL_IP="127.0.0.1", LOCAL_PORT=str(port), REMOTE_IP="127.0.0.1",
                REMOTE_TCP_PORT=str(upstream), REMOTE_UDP_PORT=str(upstream),
                POOL_SIZE="0", LOG_ENABLE="0", HALF_CLOSE_TIMEOUT="30",
-               SPLICE_CHUNK=str(256 * 1024))
+               SPLICE_CHUNK=str(256 * 1024), ENABLE_TCP="1", ENABLE_UDP="1",
+               RATE_LIMIT_KBPS="0", STATS_INTERVAL="0")
+    env.update(overrides)
     process = subprocess.Popen([str(binary)], env=env, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 5
@@ -181,6 +184,199 @@ def half_close(binary):
             stop(process)
 
 
+
+def udp_socket():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.settimeout(5)
+    return sock
+
+
+def udp_relay(binary, upstream, stats, tcp_port=0, rate=0):
+    # Reserve both protocols while selecting a port; release immediately before exec.
+    with listener() as reservation:
+        port = reservation.getsockname()[1]
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.bind(("127.0.0.1", port))
+    env = os.environ.copy()
+    env.update(LOCAL_IP="127.0.0.1", LOCAL_PORT=str(port), REMOTE_IP="127.0.0.1",
+               REMOTE_TCP_PORT=str(tcp_port), REMOTE_UDP_PORT=str(upstream),
+               ENABLE_TCP="1" if tcp_port else "0", ENABLE_UDP="1", POOL_SIZE="0",
+               RATE_LIMIT_KBPS=str(rate), STATS_FILE=str(stats), STATS_INTERVAL="1",
+               LOG_ENABLE="0")
+    process = subprocess.Popen([str(binary)], env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 5
+    while not stats.exists():
+        if process.poll() is not None:
+            raise RuntimeError(process.stderr.read())
+        if time.monotonic() >= deadline:
+            stop(process)
+            raise TimeoutError("UDP relay did not initialize")
+        time.sleep(0.02)
+    return process, ("127.0.0.1", port)
+
+
+def await_stats(path, up, down):
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        stats = json.loads(path.read_text())
+        if stats["up"] == up and stats["down"] == down:
+            return stats
+        time.sleep(0.05)
+    raise AssertionError(f"wrong forwarded-byte statistics: {stats}; expected {up}/{down}")
+
+
+def recv_exact(sock, size):
+    result = bytearray()
+    while len(result) < size:
+        data = sock.recv(size - len(result))
+        if not data:
+            raise AssertionError("unexpected TCP EOF")
+        result.extend(data)
+    return bytes(result)
+
+
+def udp_forwarding(binary, mixed):
+    with tempfile.TemporaryDirectory(prefix="udp-stats-") as tmp:
+        stats_file = Path(tmp) / "stats.json"
+        with udp_socket() as upstream, listener() as tcp_upstream:
+            process, address = udp_relay(binary, upstream.getsockname()[1], stats_file,
+                                         tcp_upstream.getsockname()[1] if mixed else 0)
+            try:
+                up = down = 0
+                if not mixed:
+                    # UDP-only must leave the TCP port free, with no required TCP target.
+                    with socket.socket() as unused_tcp:
+                        unused_tcp.bind(address)
+                else:
+                    with socket.create_connection(address, timeout=5) as client:
+                        remote, _ = tcp_upstream.accept()
+                        with remote:
+                            client.settimeout(5)
+                            remote.settimeout(5)
+                            client.sendall(b"tcp-request")
+                            assert recv_exact(remote, 11) == b"tcp-request"
+                            remote.sendall(b"tcp-response")
+                            assert recv_exact(client, 12) == b"tcp-response"
+                            up += 11
+                            down += 12
+                # Multiple clients must retain their own reverse path and datagram boundaries.
+                with udp_socket() as first, udp_socket() as second:
+                    for client in (first, second):
+                        for payload in (b"", b"x", b"u" * 1500, b"v" * 60000):
+                            client.sendto(payload, address)
+                            received, source = upstream.recvfrom(65535)
+                            assert received == payload, "UDP request was split or corrupted"
+                            reply = b"reply:" + payload
+                            upstream.sendto(reply, source)
+                            received, sender = client.recvfrom(65535)
+                            assert received == reply and sender == address
+                            up += len(payload)
+                            down += len(reply)
+                stats = await_stats(stats_file, up, down)
+                assert stats["udp_total"] == 2
+                if not mixed:
+                    assert stats["conns_total"] == 0
+                assert_idle(process, "UDP idle")
+                print("PASS udp_forwarding", "TCP+UDP" if mixed else "UDP-only", flush=True)
+            finally:
+                stop(process)
+
+
+def udp_rate_limit(binary):
+    rate = 8 * 1024
+    payload = b"x" * 1024
+    with tempfile.TemporaryDirectory(prefix="udp-rate-") as tmp:
+        stats_file = Path(tmp) / "stats.json"
+        with udp_socket() as upstream, udp_socket() as client:
+            process, address = udp_relay(binary, upstream.getsockname()[1], stats_file, rate=8)
+            try:
+                def flood(sender, target, receiver):
+                    receiver.settimeout(0.1)
+                    deadline = time.monotonic() + 1.5
+                    started = time.monotonic()
+                    received = []
+                    peers = []
+                    done = threading.Event()
+                    def collect():
+                        while not done.is_set() or time.monotonic() < deadline + 0.2:
+                            try:
+                                data, peer = receiver.recvfrom(65535)
+                                assert data == payload
+                                received.append(len(data))
+                                peers.append(peer)
+                            except socket.timeout:
+                                continue
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        reading = pool.submit(collect)
+                        try:
+                            while time.monotonic() < deadline:
+                                sender.sendto(payload, target)
+                                time.sleep(0.001)
+                        finally:
+                            done.set()
+                        reading.result(timeout=5)
+                    duration = time.monotonic() - started
+                    count = sum(received)
+                    # One-second initial burst plus one whole datagram of debt.
+                    assert 0 < count <= rate * (duration + 1) + len(payload), (count, duration)
+                    assert len(received) < 100, "UDP rate limit did not drop excess packets"
+                    return count, peers[-1]
+
+                up, association = flood(client, address, upstream)
+                down, _ = flood(upstream, association, client)
+                await_stats(stats_file, up, down)
+                print("PASS udp_rate_limit both directions", up, down, flush=True)
+            finally:
+                stop(process)
+
+
+def udp_large_low_rate(binary):
+    with tempfile.TemporaryDirectory(prefix="udp-large-") as tmp:
+        with udp_socket() as upstream, udp_socket() as client:
+            process, address = udp_relay(binary, upstream.getsockname()[1], Path(tmp)/"stats.json", rate=1)
+            try:
+                payload = b"large-datagram" * 120  # More than the 1 KiB bucket capacity.
+                client.sendto(payload, address)
+                assert upstream.recvfrom(65535)[0] == payload
+                # Wait for the debt and one more positive byte; a larger datagram must not
+                # be rejected forever simply because it exceeds the configured burst.
+                time.sleep(1.8)
+                client.sendto(payload, address)
+                assert upstream.recvfrom(65535)[0] == payload
+                print("PASS udp_large_low_rate", flush=True)
+            finally:
+                stop(process)
+
+
+def tcp_rate_limit(binary):
+    with listener() as upstream:
+        process, client = start_relay(binary, upstream.getsockname()[1], RATE_LIMIT_KBPS="16", ENABLE_UDP="0", REMOTE_UDP_PORT="0")
+        remote, _ = upstream.accept()
+        try:
+            remote.settimeout(10)
+            client.settimeout(10)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as unused_udp:
+                unused_udp.bind(client.getpeername())  # TCP-only leaves UDP unbound.
+            payload = b"x" * (48 * 1024)
+            for sender, receiver in ((client, remote), (remote, client)):
+                started = time.monotonic()
+                sender.sendall(payload)
+                received = bytearray()
+                while len(received) < len(payload):
+                    chunk = receiver.recv(len(payload)-len(received))
+                    assert chunk, "unexpected TCP EOF while rate limited"
+                    received.extend(chunk)
+                elapsed = time.monotonic()-started
+                assert bytes(received) == payload
+                assert elapsed >= 1.7, f"TCP rate limit bypassed: {elapsed} seconds"
+            print("PASS tcp_rate_limit both directions", flush=True)
+        finally:
+            client.close()
+            remote.close()
+            stop(process)
+
 with tempfile.TemporaryDirectory(prefix="tcp-pool-linux-") as tmp:
     wrapper = Path(tmp) / "small_pipe.c"
     binary = Path(tmp) / "tcp_pool"
@@ -192,3 +388,8 @@ with tempfile.TemporaryDirectory(prefix="tcp-pool-linux-") as tmp:
     backpressure(binary, reverse=False)
     backpressure(binary, reverse=True)
     half_close(binary)
+    tcp_rate_limit(binary)
+    udp_forwarding(binary, mixed=False)
+    udp_forwarding(binary, mixed=True)
+    udp_rate_limit(binary)
+    udp_large_low_rate(binary)

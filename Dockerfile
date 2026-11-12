@@ -2,10 +2,10 @@
 FROM node:20-alpine AS fe
 WORKDIR /build/panel/frontend
 COPY panel/frontend/package.json panel/frontend/package-lock.json* panel/frontend/.npmrc ./
-RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+RUN npm ci --no-audit --no-fund
 COPY panel/frontend/ ./
 # vite outDir=../web → /build/panel/web
-RUN npm run build
+RUN npm run typecheck && npm test && npm run build
 
 # ---------- 后端：Go 静态二进制（embed 前端产物） ----------
 FROM golang:1.25-alpine AS be

@@ -84,6 +84,9 @@ static Conn fresh(void) {
     source_eof = read_intr = write_intr = zero_write = false;
     calls = mods = adds = epoll_fail = 0;
     memset(masks, 0, sizeof(masks));
+    g_rate_kbps = g_tokens_up = g_tokens_down = 0;
+    g_bytes_up = g_bytes_down = g_udp_bytes_up = g_udp_bytes_down = 0;
+    rate_init(0);
     Conn c = {0};
     c.fd_l = 10; c.fd_r = 11;
     c.pipe_l2r[0] = 13; c.pipe_l2r[1] = 12;
@@ -91,6 +94,9 @@ static Conn fresh(void) {
     return c;
 }
 static pump_status_t transfer(Conn *c) {
+    // Mirror main's assignment even when RATE_LIMIT_KBPS=0.
+    g_pump_tokens = &g_tokens_up;
+    g_pump_bytes = &g_bytes_up;
     return pump(10, 11, 12, 13, &c->len_l2r, 123, &c->last_l2r);
 }
 static void small_pipe(void) {
@@ -178,6 +184,71 @@ static void watch_failure(void) {
     conn_watch(&c);
     assert(c.closed && c.fd_l == -1 && c.fd_r == -1);
 }
+static void tcp_rate_pause_resume(void) {
+    Conn c = fresh();
+    g_rate_kbps = 1; rate_init(1000);
+    available = 4096;
+    assert(transfer(&c) == PUMP_OK);
+    assert(delivered == 1024 && g_tokens_up == 0 && g_bytes_up == 1024);
+    conn_watch(&c);
+    assert(!(masks[10] & EPOLLIN));
+    int old_calls = calls, old_mods = mods;
+    assert(transfer(&c) == PUMP_OK);
+    conn_watch(&c);
+    assert(calls == old_calls && mods == old_mods);
+    assert(rate_refill(1500));
+    conn_watch(&c);
+    assert(masks[10] & EPOLLIN);
+    assert(transfer(&c) == PUMP_OK);
+    assert(delivered == 1536 && g_tokens_up == 0);
+    assert(!rate_refill(1500)); // A repeated timestamp cannot mint tokens.
+}
+static void udp_rate_and_stats(void) {
+    (void)fresh();
+    g_rate_kbps = 1; rate_init(0);
+    assert(udp_rate_allowed(g_tokens_up));
+    udp_record_sent(&g_tokens_up, &g_udp_bytes_up, 1500);
+    assert(g_tokens_up == -476 && g_udp_bytes_up == 1500);
+    assert(!udp_rate_allowed(g_tokens_up));
+    assert(udp_rate_allowed(g_tokens_down)); // Independent reverse budget.
+    udp_record_sent(&g_tokens_down, &g_udp_bytes_down, -1);
+    assert(g_tokens_down == 1024 && !g_udp_bytes_down);
+    assert(!rate_refill(400));
+    assert(!udp_rate_allowed(g_tokens_up));
+    assert(rate_refill(500));
+    assert(udp_rate_allowed(g_tokens_up));
+    // A datagram larger than one second of rate is whole and eventually repaid.
+    udp_record_sent(&g_tokens_up, &g_udp_bytes_up, 60000);
+    assert(!udp_rate_allowed(g_tokens_up));
+    assert(rate_refill(60500));
+    assert(g_tokens_up == 1024 && g_tokens_down == 1024);
+    assert(g_udp_bytes_up == 61500);
+    g_rate_kbps = 0;
+    g_tokens_up = 0;
+    assert(udp_rate_allowed(g_tokens_up));
+    udp_record_sent(&g_tokens_up, &g_udp_bytes_up, 60000);
+    assert(g_tokens_up == 0 && g_udp_bytes_up == 121500);
+}
+static void shared_tcp_udp_budget(void) {
+    Conn c = fresh();
+    g_rate_kbps = 2; rate_init(0);
+    udp_record_sent(&g_tokens_up, &g_udp_bytes_up, 512);
+    available = 4096;
+    assert(transfer(&c) == PUMP_OK);
+    assert(delivered == 1536 && g_tokens_up == 0);
+    assert(g_bytes_up + g_udp_bytes_up == 2048);
+    assert(!udp_rate_allowed(g_tokens_up));
+    assert(g_tokens_down == 2048);
+}
+static void forwarded_stats(void) {
+    Conn c = fresh();
+    available = 20000; write_limit = 123;
+    assert(transfer(&c) == PUMP_OK);
+    assert(g_bytes_up == 123); // Queued bytes have not yet reached the target.
+    write_limit = SIZE_MAX;
+    assert(transfer(&c) == PUMP_OK);
+    assert(g_bytes_up == 20000);
+}
 int main(int argc, char **argv) {
     (void)conn_list;
     assert(argc == 2);
@@ -187,6 +258,10 @@ int main(int argc, char **argv) {
         {"interrupted", interrupted}, {"partial_write", partial_write},
         {"zero_drain", zero_drain}, {"idle", idle},
         {"connecting", connecting}, {"watch_failure", watch_failure},
+        {"tcp_rate_pause_resume", tcp_rate_pause_resume},
+        {"udp_rate_and_stats", udp_rate_and_stats},
+        {"shared_tcp_udp_budget", shared_tcp_udp_budget},
+        {"forwarded_stats", forwarded_stats},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         if (!strcmp(argv[1], cases[i].name)) { cases[i].fn(); return 0; }
@@ -205,7 +280,9 @@ with tempfile.TemporaryDirectory(prefix="tcp-pool-test-") as tmp:
     ], check=True)
     failures = 0
     for case in ["small_pipe", "backpressure", "stable_watch", "budget", "interrupted",
-                 "partial_write", "zero_drain", "idle", "connecting", "watch_failure"]:
+                 "partial_write", "zero_drain", "idle", "connecting", "watch_failure",
+                 "tcp_rate_pause_resume", "udp_rate_and_stats", "shared_tcp_udp_budget",
+                 "forwarded_stats"]:
         result = subprocess.run([str(binary), case], capture_output=True, text=True, timeout=5)
         print(f"{'PASS' if result.returncode == 0 else 'FAIL'} {case}")
         if result.returncode:

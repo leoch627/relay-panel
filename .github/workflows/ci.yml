@@ -16,9 +16,12 @@ jobs:
       - name: Build relay
         run: gcc -O2 -pthread -Wall -Wextra -Wshadow -Wformat=2 -o /tmp/tcp_pool tcp_pool.c
       - name: Version feature probe
-        run: /tmp/tcp_pool --version | grep -q "enable_tcp" && /tmp/tcp_pool --version | grep -q "rate_limit"
+        run: /tmp/tcp_pool --version | grep -q "enable_tcp" && /tmp/tcp_pool --version | grep -q "udp_rate_limit"
       - name: Fault injection with sanitizers
-        run: python3 tests/test_forwarding.py
+        run: |
+          python3 tests/test_forwarding.py
+          python3 tests/test_udp.py
+          python3 tests/test_panel_install.py
       - name: Real TCP backpressure and half-close tests
         run: python3 tests/test_linux.py
       - name: relays.conf parser regression (incl. ENABLE_TCP/UDP)
@@ -40,17 +43,20 @@ jobs:
           LOCAL_IP=::
           LOCAL_PORT=30001
           REMOTE_IP=example.com
-          REMOTE_TCP_PORT=8443
+          REMOTE_TCP_PORT=0
           REMOTE_UDP_PORT=8443
           ENABLE_TCP=0
           ENABLE_UDP=1
+          RATE_LIMIT_KBPS=64
           CONF
           sed -i 's|SRC="/etc/tcp_pool/relays.conf"|SRC="/tmp/tp/relays.conf"|; s|DST="/etc/tcp_pool"|DST="/tmp/tp"|' /tmp/tcp-pool-parse
           bash /tmp/tcp-pool-parse
           grep -q '^ENABLE_TCP=1$' /tmp/tp/HK.conf
           grep -q '^ENABLE_UDP=0$' /tmp/tp/HK.conf
           grep -q '^ENABLE_UDP=1$' /tmp/tp/V6UDP.conf
-          grep -q '^ENABLE_TCP=1$' /tmp/tp/V6UDP.conf
+          grep -q '^ENABLE_TCP=0$' /tmp/tp/V6UDP.conf
+          grep -q '^RATE_LIMIT_KBPS=64$' /tmp/tp/V6UDP.conf
+          grep -q '^STATS_FILE=/run/tcp-pool/V6UDP.stats.json$' /tmp/tp/V6UDP.conf
           echo "parser regression passed"
 
   panel:
@@ -62,7 +68,7 @@ jobs:
         with:
           node-version: 20
       - name: Build frontend (React + shadcn/ui)
-        run: cd panel/frontend && npm install --no-audit --no-fund && npm run typecheck && npm run build
+        run: cd panel/frontend && npm ci --no-audit --no-fund && npm run typecheck && npm test && npm run build
       - uses: actions/setup-go@v5
         with:
           go-version-file: panel/go.mod
@@ -70,11 +76,13 @@ jobs:
         run: |
           cd panel
           go vet ./...
+          go test -race ./...
           go build ./...
 
   dist:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: [linux, panel]
     if: github.ref_type == 'tag' || github.ref == 'refs/heads/main'
     permissions:
       contents: write
@@ -113,7 +121,11 @@ jobs:
       - name: Verify static linking
         run: |
           file dist/tcp_pool-linux-*-musl dist/relay-panel-client-linux-* | tee /tmp/file.txt
-          grep -c "statically linked" /tmp/file.txt >= 5 || (echo "存在非静态产物" && exit 1)
+          test "$(wc -l < /tmp/file.txt)" -eq 4
+          if grep -v "statically linked" /tmp/file.txt; then
+            echo "存在非静态产物"
+            exit 1
+          fi
       - name: Alpine smoke test (amd64 client)
         run: |
           docker run --rm -v "$PWD/dist:/d" alpine:latest /d/relay-panel-client-linux-amd64 -version

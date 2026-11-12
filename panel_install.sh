@@ -2,7 +2,7 @@
 # relay-panel 一键安装脚本
 # 用法：bash panel_install.sh
 # 主控模式环境变量：
-#   PANEL_REPO          源码仓库（默认 Xeloan/TCP-preconnection-relay）
+#   PANEL_REPO          源码仓库（默认 leoch627/relay-panel）
 #   PANEL_PORT          面板端口（默认 8081）
 #   PANEL_ADMIN_PASSWORD 初始 admin 密码（默认自动生成）
 #   PANEL_SKIP_TUNE=1   跳过 BBR + TCP 调优
@@ -25,6 +25,8 @@ TCPPool_BIN=/root/tcp_pool
 STATE_DIR=/etc/relay-panel
 CONF_DIR=/etc/tcp_pool
 TUNE_SYSCTL=/etc/sysctl.d/99-custom-network-tuning.conf
+TCPPOOL_UPDATED=0
+TCPPOOL_ACTIVE_UNITS=()
 
 if [ "$PANEL_SLAVE" = "1" ]; then
     [ -n "$PANEL_MASTER_URL" ] && [ -n "$PANEL_NODE_KEY" ] || {
@@ -76,7 +78,7 @@ echo "架构: linux-$ARCH"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR=""
 CLONED=0
-cleanup_src() { [ "$CLONED" -eq 1 ] && [ -n "$SRC_DIR" ] && rm -rf "$SRC_DIR"; }
+cleanup_src() { if [ "$CLONED" -eq 1 ] && [ -n "$SRC_DIR" ]; then rm -rf "$SRC_DIR"; fi; }
 trap cleanup_src EXIT
 
 get_source() {
@@ -100,20 +102,56 @@ if [ "$PANEL_SLAVE" != "1" ]; then
 fi
 
 # ---------- 安装底层 tcp_pool ----------
-# 面板需要 ENABLE_TCP/ENABLE_UDP 特性（tcp_pool v1.7+），安装时以 --version 输出确认
+# 面板需要 UDP 双向限速特性（tcp_pool v1.8+），安装时以 --version 输出确认
 tcp_pool_has_features() {
-    "$1" --version 2>/dev/null | grep -q "enable_tcp"
+    "$1" --version 2>/dev/null | grep -q "udp_rate_limit"
+}
+
+install_binary_atomic() {
+    local source="$1" destination="$2" tmp
+    tmp="$(mktemp "${destination}.install.XXXXXX")" || return 1
+    if ! install -m 755 "$source" "$tmp" || ! mv -f "$tmp" "$destination"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+snapshot_running_tcp_pool_units() {
+    # 被控端由 agent 持久化内核指纹并按主控最新状态重启，包含单文件安装路径。
+    [ "$PANEL_SLAVE" != "1" ] || return 0
+    local units unit rest
+    units="$(systemctl list-units --type=service --state=running --no-legend --no-pager --plain 'tcp-pool@*.service')" || {
+        echo "错误：无法获取正在运行的转发实例，已取消内核升级。" >&2
+        return 1
+    }
+    TCPPOOL_ACTIVE_UNITS=()
+    while read -r unit rest; do
+        case "$unit" in
+            tcp-pool@.service) ;;
+            tcp-pool@*.service) TCPPOOL_ACTIVE_UNITS+=("$unit") ;;
+        esac
+    done <<< "$units"
+}
+
+restart_updated_tcp_pool_units() {
+    [ "$PANEL_SLAVE" != "1" ] && [ "$TCPPOOL_UPDATED" = "1" ] || return 0
+    [ "${#TCPPOOL_ACTIVE_UNITS[@]}" -gt 0 ] || return 0
+    echo "正在刷新 ${#TCPPOOL_ACTIVE_UNITS[@]} 个原有转发实例的内核..."
+    # try-restart 不会重新启动升级期间被用户或流量配额停止的实例。
+    systemctl try-restart "${TCPPOOL_ACTIVE_UNITS[@]}"
 }
 
 install_tcp_pool() {
+    snapshot_running_tcp_pool_units
     install_build_deps   #编译路径才装 gcc/build-essential
     echo "编译转发核心 tcp_pool ..."
     local tmp
-    tmp="$(mktemp /root/tcp_pool.build.XXXXXX)"
+    tmp="$(mktemp "${TCPPool_BIN}.build.XXXXXX")"
     if gcc -O2 -pthread -o "$tmp" "$SRC_DIR/tcp_pool.c"; then
         chmod +x "$tmp"
         if tcp_pool_has_features "$tmp"; then
             mv -f "$tmp" "$TCPPool_BIN"
+            TCPPOOL_UPDATED=1
             echo "tcp_pool 编译完成（含协议开关特性）"
             return 0
         fi
@@ -123,12 +161,40 @@ install_tcp_pool() {
     # 编译失败或无特性时回退到仓库预编译二进制
     local prebuilt="$SRC_DIR/dist/tcp_pool-linux-$ARCH"
     if [ -f "$prebuilt" ] && tcp_pool_has_features "$prebuilt"; then
-        cp -f "$prebuilt" "$TCPPool_BIN"
-        chmod +x "$TCPPool_BIN"
+        install_binary_atomic "$prebuilt" "$TCPPool_BIN"
+        TCPPOOL_UPDATED=1
         echo "tcp_pool 使用预编译二进制: linux-$ARCH"
         return 0
     fi
     echo "错误：tcp_pool 安装失败（编译失败且无可用预编译包）" >&2
+    return 1
+}
+
+# Build from current source when possible; otherwise only accept matching source manifests.
+install_panel_bin() {
+    if command -v go >/dev/null 2>&1; then
+        local tmp
+        tmp="$(mktemp "${PANEL_BIN}.build.XXXXXX")"
+        if (cd "$SRC_DIR/panel" && go build -trimpath -o "$tmp" .); then
+            chmod 755 "$tmp"
+            mv -f "$tmp" "$PANEL_BIN"
+            return 0
+        fi
+        rm -f "$tmp"
+        echo "源码构建失败，尝试校验预编译面板。" >&2
+    fi
+    local prebuilt="$SRC_DIR/dist/relay-panel-linux-$ARCH"
+    if command -v sha256sum >/dev/null 2>&1 &&
+       [ -f "$SRC_DIR/dist/panel-sources.sha256" ] &&
+       [ -f "$prebuilt.sha256" ] &&
+       (cd "$SRC_DIR" && sha256sum -c dist/panel-sources.sha256 >/dev/null 2>&1 &&
+        sha256sum -c "dist/relay-panel-linux-$ARCH.sha256" >/dev/null 2>&1) &&
+       "$prebuilt" -version 2>/dev/null | grep -q 'relay-panel v1.1.0'; then
+        install_binary_atomic "$prebuilt" "$PANEL_BIN"
+        echo "面板二进制已校验，与当前源码一致。"
+        return 0
+    fi
+    echo "错误：预编译面板与源码不匹配；请安装 Go 1.24+ 后重试，或使用与此源码匹配的发行包。" >&2
     return 1
 }
 
@@ -139,17 +205,21 @@ if [ "$PANEL_SLAVE" = "1" ]; then
         local url="${PANEL_CLIENT_URL:-https://github.com/${PANEL_REPO}/releases/latest/download/relay-panel-client-linux-${ARCH}}"
         command -v curl >/dev/null 2>&1 || return 1
         echo "尝试下载单文件客户端: $url"
-        if ! curl -fsSL --connect-timeout 10 -o "$PANEL_BIN" "$url"; then
+        local tmp
+        tmp="$(mktemp "${PANEL_BIN}.download.XXXXXX")"
+        if ! curl -fsSL --connect-timeout 10 -o "$tmp" "$url"; then
+            rm -f "$tmp"
             echo "下载失败，回退源码安装。"
             return 1
         fi
-        chmod +x "$PANEL_BIN"
-        if "$PANEL_BIN" -version 2>/dev/null | grep -q "relay-panel"; then
+        chmod +x "$tmp"
+        if "$tmp" -version 2>/dev/null | grep -q 'relay-panel v1.1.0'; then
+            mv -f "$tmp" "$PANEL_BIN"
             echo "单文件客户端就绪（内嵌 musl tcp_pool，免编译）。"
             return 0
         fi
         echo "客户端无法运行，回退源码安装。"
-        rm -f "$PANEL_BIN"
+        rm -f "$tmp"
         return 1
     }
 
@@ -164,22 +234,6 @@ if [ "$PANEL_SLAVE" = "1" ]; then
             install_tcp_pool
         fi
 
-        # ---------- 安装面板 ----------
-        install_panel_bin() {
-            local prebuilt="$SRC_DIR/dist/relay-panel-linux-$ARCH"
-            if [ -f "$prebuilt" ] && "$prebuilt" -h >/dev/null 2>&1; then
-                install -m 755 "$prebuilt" "$PANEL_BIN"
-                echo "面板二进制: dist/relay-panel-linux-$ARCH"
-                return 0
-            fi
-            if command -v go >/dev/null 2>&1; then
-                echo "从源码构建面板 ..."
-                (cd "$SRC_DIR/panel" && go build -trimpath -o "$PANEL_BIN" .)
-                return 0
-            fi
-            echo "错误：找不到可用的面板二进制，且本机无 Go 编译器" >&2
-            return 1
-        }
         install_panel_bin
     fi
 else
@@ -190,21 +244,6 @@ else
         install_tcp_pool
     fi
 
-    install_panel_bin() {
-        local prebuilt="$SRC_DIR/dist/relay-panel-linux-$ARCH"
-        if [ -f "$prebuilt" ] && "$prebuilt" -h >/dev/null 2>&1; then
-            install -m 755 "$prebuilt" "$PANEL_BIN"
-            echo "面板二进制: dist/relay-panel-linux-$ARCH"
-            return 0
-        fi
-        if command -v go >/dev/null 2>&1; then
-            echo "从源码构建面板 ..."
-            (cd "$SRC_DIR/panel" && go build -trimpath -o "$PANEL_BIN" .)
-            return 0
-        fi
-        echo "错误：找不到可用的面板二进制，且本机无 Go 编译器" >&2
-        return 1
-    }
     install_panel_bin
 fi
 
@@ -307,6 +346,8 @@ EOF
     sleep 1
     systemctl is-active relay-panel >/dev/null || { journalctl -u relay-panel -n 30 --no-pager; exit 1; }
 fi
+
+restart_updated_tcp_pool_units
 
 # ---------- BBR + TCP 自动调优 ----------
 if [ "${PANEL_SKIP_TUNE:-0}" != "1" ]; then

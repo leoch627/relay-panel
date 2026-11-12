@@ -18,6 +18,7 @@
 #include <sys/epoll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -87,7 +88,7 @@ static int cfg_stats_interval = 30; //统计文件写入周期（秒），0关�
 static int cfg_rate_limit_kbps = 0; //实例级限速（KB/s，双向各自限制），0不限
 static char *cfg_stats_file = NULL; //统计JSON输出文件
 
-#define TCP_POOL_VERSION "v1.7"
+#define TCP_POOL_VERSION "v1.8"
 
 typedef struct LogNode {
     char *msg;
@@ -99,6 +100,7 @@ static LogNode *log_head = NULL, *log_tail = NULL;
 static int log_queue_len = 0;
 static int log_dropped = 0;
 
+static void log_enqueue_v(const char *fmt, va_list ap) __attribute__((format(printf, 1, 0)));
 static void log_enqueue_v(const char *fmt, va_list ap) {//产生日志
     if (!LOG_ENABLE) return;
 
@@ -131,6 +133,7 @@ static void log_enqueue_v(const char *fmt, va_list ap) {//产生日志
     pthread_mutex_unlock(&log_mtx);
 }
 
+static void log_enqueue(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void log_enqueue(const char *fmt, ...) {
     if (!LOG_ENABLE) return;
     va_list ap;
@@ -554,7 +557,7 @@ static Conn *conn_list = NULL;
 #else
 #define COUNTER_VAR
 #endif
-static COUNTER_VAR uint64_t g_bytes_up;        //客户端->远端累计（TCP，源端读取时计数）
+static COUNTER_VAR uint64_t g_bytes_up;        //客户端->远端累计（TCP，成功写入目标时计数）
 static COUNTER_VAR uint64_t g_bytes_down;      //远端->客户端累计（TCP）
 static COUNTER_VAR uint64_t g_udp_bytes_up;    //客户端->远端累计（UDP）
 static COUNTER_VAR uint64_t g_udp_bytes_down;  //远端->客户端累计（UDP）
@@ -565,8 +568,46 @@ static COUNTER_VAR uint64_t g_udp_total;       //历史UDP会话数
 static int64_t  g_rate_kbps;       //限速KB/s，main按配置填充，0=不限
 static int64_t  g_tokens_up;       //当前周期可搬运字节（l2r）
 static int64_t  g_tokens_down;     //当前周期可搬运字节（r2l）
+static uint64_t g_rate_updated_ms;
+static uint64_t g_rate_remainder;
 static int64_t *g_pump_tokens;     //本次pump方向的令牌桶
 static uint64_t *g_pump_bytes;     //本次pump方向的字节计数
+
+// TCP 和 UDP 共用每方向的字节预算。UDP 不拆包：有额度时可发送一个完整
+// 数据报并记入债务，其后丢弃超额数据报，直到额度补足，最大超发一个数据报。
+static bool udp_rate_allowed(int64_t tokens) {
+    return g_rate_kbps == 0 || tokens > 0;
+}
+
+static void udp_record_sent(int64_t *tokens, uint64_t *bytes, ssize_t sent) {
+    if (sent < 0) return;
+    if (g_rate_kbps > 0) *tokens -= sent;
+    *bytes += (uint64_t)sent;
+}
+
+static void rate_init(uint64_t now_ms) {
+    g_tokens_up = g_tokens_down = g_rate_kbps * 1024;
+    g_rate_updated_ms = now_ms;
+    g_rate_remainder = 0;
+}
+
+// 按真实经过时间补充，不因事件循环忙碌或初次清理而凭空多给一秒额度。
+// 返回是否需要重新触发 TCP 读事件。
+static bool rate_refill(uint64_t now_ms) {
+    if (g_rate_kbps <= 0 || now_ms <= g_rate_updated_ms) return false;
+    uint64_t elapsed = now_ms - g_rate_updated_ms;
+    g_rate_updated_ms = now_ms;
+    // 一天足以清偿最大 UDP 债务并填满桶，同时限制乘法范围。
+    if (elapsed > 86400000ULL) elapsed = 86400000ULL;
+    int64_t capacity = g_rate_kbps * 1024;
+    uint64_t credit = (uint64_t)capacity * elapsed + g_rate_remainder;
+    int64_t refill = (int64_t)(credit / 1000);
+    g_rate_remainder = credit % 1000;
+    bool paused_up = g_tokens_up <= 0, paused_down = g_tokens_down <= 0;
+    g_tokens_up = g_tokens_up + refill > capacity ? capacity : g_tokens_up + refill;
+    g_tokens_down = g_tokens_down + refill > capacity ? capacity : g_tokens_down + refill;
+    return (paused_up && g_tokens_up > 0) || (paused_down && g_tokens_down > 0);
+}
 
 static void conn_close(Conn *c) {//关闭连接
     if (!c || c->closed) return;
@@ -589,7 +630,7 @@ static void conn_watch(Conn *c) {
     if (c->connecting) {
         ev_r |= EPOLLOUT | EPOLLRDHUP;
     } else {
-        //限速令牌耗尽的方向不注册读事件，主循环每秒补充令牌后会重新触发
+        //限速令牌耗尽的方向不注册读事件，主循环补充令牌后会重新触发
         bool can_read_l = (g_rate_kbps == 0 || g_tokens_up > 0);
         bool can_read_r = (g_rate_kbps == 0 || g_tokens_down > 0);
         //有积压时只等待目标可写。实际pipe容量可能远小于cfg_splice_chunk，
@@ -633,6 +674,7 @@ static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,
                                SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
             if (n > 0) {
                 *pipe_len -= (size_t)n;
+                if (g_pump_bytes) *g_pump_bytes += (uint64_t)n;
                 *last_ts = now_ms;
                 continue;
             }
@@ -646,19 +688,18 @@ static pump_status_t pump(int src_fd, int dst_fd, int pipe_in, int pipe_out,
         if (moved >= cfg_splice_chunk) return PUMP_MORE;
 
         //限速：本方向令牌耗尽时停止读取（不返回PUMP_MORE避免事件风暴），
-        //由主循环每秒补充令牌后重新注册读事件。
-        if (g_pump_tokens && *g_pump_tokens <= 0) return PUMP_OK;
+        //由主循环补充令牌后重新注册读事件。
+        if (g_rate_kbps > 0 && g_pump_tokens && *g_pump_tokens <= 0) return PUMP_OK;
 
         size_t want = cfg_splice_chunk - moved;
-        if (g_pump_tokens && (int64_t)want > *g_pump_tokens) want = (size_t)*g_pump_tokens;
+        if (g_rate_kbps > 0 && g_pump_tokens && (int64_t)want > *g_pump_tokens) want = (size_t)*g_pump_tokens;
 
         ssize_t n = splice(src_fd, NULL, pipe_in, NULL, want,
                            SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (n > 0) {
             *pipe_len += (size_t)n;
             moved += (size_t)n;
-            if (g_pump_tokens) *g_pump_tokens -= (int64_t)n;
-            if (g_pump_bytes) *g_pump_bytes += (uint64_t)n;
+            if (g_rate_kbps > 0 && g_pump_tokens) *g_pump_tokens -= (int64_t)n;
             *last_ts = now_ms;
             continue;
         }
@@ -748,7 +789,7 @@ static UdpAssoc* udp_get_or_create(const struct sockaddr_storage *cli,
     n->last_act = now_ms;
 
     struct epoll_event ev;
-    ev.events = EPOLLIN | EPOLLET;
+    ev.events = EPOLLIN; //UDP采用水平触发，允许每轮只处理有限个报文
     ev.data.ptr = (void*)((uintptr_t)n | TAG_UDP_ASSOC);
     if (epoll_ctl(epfd_, EPOLL_CTL_ADD, fd, &ev) != 0) { close(fd); free(n); return NULL; }
 
@@ -771,6 +812,48 @@ static void udp_remove(UdpAssoc *u, uint32_t idx, int epfd_) {
     }
     free(u);
     if (g_udp_sessions > 0) g_udp_sessions--;
+}
+
+// 每个就绪事件最多处理64个数据报；水平触发会继续调度剩余数据，避免UDP
+// 洪流独占线程而阻塞其他连接、令牌补充和统计写入。
+static void udp_receive_clients(uint64_t now) {
+    for (unsigned batch = 0; batch < 64; batch++) {
+        uint8_t buf[65535];
+        struct sockaddr_storage cli;
+        socklen_t clen = sizeof(cli);
+
+        ssize_t n = recvfrom(udp_listen_fd, buf, sizeof(buf), 0, (struct sockaddr*)&cli, &clen);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            break;
+        }
+
+        if (!udp_rate_allowed(g_tokens_up)) continue;
+        UdpAssoc *u = udp_get_or_create(&cli, clen, now, epfd);
+        if (!u) continue;
+
+        ssize_t s = send(u->up_fd, buf, (size_t)n, MSG_DONTWAIT);
+        udp_record_sent(&g_tokens_up, &g_udp_bytes_up, s);
+        // UDP发送失败直接丢包，避免阻塞；失败或限速丢包不计入已转发流量。
+        u->last_act = now;
+    }
+}
+
+static void udp_receive_remote(UdpAssoc *u, uint64_t now) {
+    for (unsigned batch = 0; batch < 64; batch++) {
+        uint8_t buf[65535];
+        ssize_t n = recv(u->up_fd, buf, sizeof(buf), 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            break;
+        }
+
+        if (!udp_rate_allowed(g_tokens_down)) continue;
+        ssize_t s = sendto(udp_listen_fd, buf, (size_t)n, MSG_DONTWAIT,
+                           (struct sockaddr*)&u->cli, u->cli_len);
+        udp_record_sent(&g_tokens_down, &g_udp_bytes_down, s);
+        u->last_act = now;
+    }
 }
 
 //把统计快照写到 STATS_FILE（临时文件+rename，读者永远看到完整JSON）
@@ -811,16 +894,14 @@ static void ensure_stats_dir(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--version") == 0) {
-        printf("tcp_pool %s (features: enable_tcp, enable_udp, stats, rate_limit)\n", TCP_POOL_VERSION);
+        printf("tcp_pool %s (features: enable_tcp, enable_udp, stats, rate_limit, udp_rate_limit)\n", TCP_POOL_VERSION);
         return 0;
     }
 
     char *env;
     load_runtime_config();
     g_rate_kbps = (int64_t)cfg_rate_limit_kbps;
-    if (g_rate_kbps > 0) {
-        g_tokens_up = g_tokens_down = g_rate_kbps * 1024; //开局满令牌
-    }
+    rate_init(mono_ms());
 
     if (!cfg_enable_tcp && !cfg_enable_udp) {
         fprintf(stderr, "ERROR: ENABLE_TCP and ENABLE_UDP are both off\n");
@@ -931,7 +1012,7 @@ int main(int argc, char **argv) {
         }
 
         struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET;
+        ev.events = EPOLLIN; //与UDP会话一样，每轮有处理上限
         ev.data.ptr = TAG_UDP_LISTEN;
         if (epoll_ctl(epfd, EPOLL_CTL_ADD, udp_listen_fd, &ev) != 0) {
             log_enqueue("socket listen failed");
@@ -954,6 +1035,13 @@ int main(int argc, char **argv) {
         }
         uint64_t now = mono_ms();
         log_flush_rate_limited(now);
+        if (rate_refill(now)) {
+            // UDP 也可能耗尽某个方向；重新检查所有 TCP 等待者。
+            for (Conn *rc = conn_list; rc; rc = rc->next) {
+                rc->repoll_l = rc->repoll_r = true;
+                conn_watch(rc);
+            }
+        }
 
         for (int i = 0; i < nfds; i++) {
             void *tagp = events[i].data.ptr;
@@ -1028,25 +1116,7 @@ int main(int argc, char **argv) {
 
             //UDP listener
             if (tagp == TAG_UDP_LISTEN) {
-                while (1) {
-                    uint8_t buf[65535];
-                    struct sockaddr_storage cli;
-                    socklen_t clen = sizeof(cli);
-
-                    ssize_t n = recvfrom(udp_listen_fd, buf, sizeof(buf), 0, (struct sockaddr*)&cli, &clen);
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        break;
-                    }
-
-                    UdpAssoc *u = udp_get_or_create(&cli, clen, now, epfd);
-                    if (!u) continue;
-                    g_udp_bytes_up += (uint64_t)n;
-
-                    ssize_t s = send(u->up_fd, buf, (size_t)n, MSG_DONTWAIT);
-                    (void)s; // UDP发送失败直接丢包，避免阻塞
-                    u->last_act = now;
-                }
+                udp_receive_clients(now);
                 continue;
             }
 
@@ -1057,20 +1127,7 @@ int main(int argc, char **argv) {
                 UdpAssoc *u = (UdpAssoc*)(pv & ~TAG_MASK2);
                 if (!u) continue;
 
-                while (1) {
-                    uint8_t buf[65535];
-                    ssize_t n = recv(u->up_fd, buf, sizeof(buf), 0);
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        break;
-                    }
-
-                    ssize_t s = sendto(udp_listen_fd, buf, (size_t)n, MSG_DONTWAIT,
-                                       (struct sockaddr*)&u->cli, u->cli_len);
-                    (void)s;
-                    if (n > 0) g_udp_bytes_down += (uint64_t)n;
-                    u->last_act = now;
-                }
+                udp_receive_remote(u, now);
                 continue;
             }
 
@@ -1198,18 +1255,6 @@ int main(int argc, char **argv) {
         static uint64_t last_clean = 0;
         if (now - last_clean > 1000) {
             last_clean = now;
-
-            //限速令牌按秒补充（允许积攒1秒突发），随后重新注册因限速摘掉的读事件。
-            //令牌耗尽时两个方向都可能没有事件源，必须主动重挂，否则连接会卡死。
-            if (g_rate_kbps > 0) {
-                int64_t refill = g_rate_kbps * 1024;
-                g_tokens_up = (g_tokens_up + refill > refill) ? refill : g_tokens_up + refill;
-                g_tokens_down = (g_tokens_down + refill > refill) ? refill : g_tokens_down + refill;
-                for (Conn *rc = conn_list; rc; rc = rc->next) {
-                    rc->repoll_l = rc->repoll_r = true;
-                    conn_watch(rc);
-                }
-            }
 
             Conn *prev = NULL, *cur = conn_list;
             while (cur) {

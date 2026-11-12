@@ -3,8 +3,13 @@
 # 用法：./build-client.sh [输出目录，默认 dist]
 set -euo pipefail
 
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$repo_dir"
 out_dir="${1:-dist}"
 mkdir -p "$out_dir" panel/bin
+out_dir="$(cd "$out_dir" && pwd)"
+command -v npm >/dev/null 2>&1 || { echo "需要 npm 构建当前前端" >&2; exit 1; }
+(cd panel/frontend && npm ci --no-audit --no-fund && npm run typecheck && npm test && npm run build)
 
 command -v zig >/dev/null 2>&1 || { echo "需要 zig（brew install zig / 官方安装）" >&2; exit 1; }
 
@@ -15,8 +20,8 @@ cp "$out_dir/tcp_pool-linux-amd64-musl" "$out_dir/tcp_pool-linux-arm64-musl" pan
 
 echo "==> 构建单文件客户端（Go 静态 + 内嵌 tcp_pool）..."
 cd panel
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_tcpool -trimpath -ldflags="-s -w" -o "../$out_dir/relay-panel-client-linux-amd64" .
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags embed_tcpool -trimpath -ldflags="-s -w" -o "../$out_dir/relay-panel-client-linux-arm64" .
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags embed_tcpool -trimpath -ldflags="-s -w" -o "$out_dir/relay-panel-client-linux-amd64" .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags embed_tcpool -trimpath -ldflags="-s -w" -o "$out_dir/relay-panel-client-linux-arm64" .
 cd ..
 
 chmod +x "$out_dir"/relay-panel-client-* "$out_dir"/*-musl

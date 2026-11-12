@@ -5,10 +5,10 @@
 ## 特性
 
 - **多用户**：管理员/普通用户两级权限，普通用户只能看到和操作自己的转发；bcrypt 密码、会话、登录防爆破锁定
-- **主从架构**：主控统一下发配置，多台被控节点执行转发；节点出站轮询（约 5 秒生效），穿透 NAT，无需开放入站管理端口
+- **主从架构**：主控统一下发配置，多台被控节点执行转发；节点出站轮询（正常网络下约 5 秒生效），穿透 NAT，无需开放入站管理端口
 - **TLS 加密**：主控自动自签证书启用 HTTPS，节点安装命令自动携带证书 SHA256 指纹固定，防中间人
 - **流量体系**：内核计数 → 规则级配额超限自动停机（本地/节点双侧执行）→ 流量统计页（趋势图 / 年度热力图 / 按转发与节点分组占比）
-- **实例限速**：内核令牌桶限速（KB/s，双向各自限制）
+- **实例限速**：内核令牌桶限速（KB/s，上下行分别限制；同方向 TCP 与 UDP 共享额度）
 - **TCP + UDP 独立开关**：每条转发可任选 TCP / UDP / 两者
 - **一键 BBR + TCP 调优**：安装时按内存自动选档（保守/标准/激进），面板内可切换
 - **被控端单文件客户端**：Go 静态二进制内嵌 musl 静态 tcp_pool，免编译；无 systemd 环境（Alpine/OpenRC）自动直跑子进程模式，崩溃自愈
@@ -45,11 +45,43 @@ docker compose up -d --build   # http://服务器IP:8081
 ```bash
 # 后端（Go，内嵌前端产物）
 cd panel && go build .
-./relay-panel -addr :8081 -dry-run -admin-password dev123
+PANEL_TLS=0 ./relay-panel -addr :8081 -dry-run -state /tmp/relay-panel-dev/panel.json -conf-dir /tmp/relay-panel-dev/conf -admin-password dev123
 
 # 前端（React + shadcn/ui，Vite）
-cd panel/frontend && npm install && npm run dev   # 开发模式代理 /api 到 127.0.0.1:8081
+cd panel/frontend && npm ci && npm run dev   # 开发模式代理 /api 到 127.0.0.1:8081
 npm run build                                      # 产物输出 panel/web/
 ```
 
 转发内核、systemd 模板与原版 `relay` CLI 保持兼容（`/etc/tcp_pool/relays.conf` 双向同步）。
+
+## UDP 转发与限额
+
+创建规则时可选择仅 TCP、仅 UDP，或同时启用两者。UDP-only 只需填写 UDP 远端端口；TCP 和 UDP 可以使用同一监听端口，也可以分别转发到不同的远端端口。批量添加例如：
+
+```text
+dns:20053 1.1.1.1 53 udp
+20054 1.1.1.1 udp
+web:20443 example.com 443 both
+```
+
+第二行省略远端端口，使用监听端口 20054；没有标签时自动生成未占用的标签。导出后重新导入会保留各规则的目标节点，显式选择批量目标节点时才覆盖它。
+
+限速 0 表示不限速。启用限速后，上下行各有独立额度，同方向 TCP 和 UDP 共用额度。UDP 保持数据报完整，超出额度的数据报直接丢弃，不等待发送；允许最多一个完整数据报的额外突发，之后等待额度补足。这适用于接受 UDP 丢包的业务。流量统计包含成功转发的 TCP 与 UDP 字节。
+
+配额超限会停止规则，并在节点重启后保持停机。提高配额到已用量以上或取消配额可解除限制；手动“启动”会重新开始计数。普通配置编辑不会清除超限状态。配额按周期检查，允许一个检查周期内的超量。
+
+UDP-only 的测活使用同端口 TCP 连接作为参考，不能据此证明 UDP 服务是否可用；失败会显示弱提示。实际 UDP 可用性需要使用目标协议客户端验证。
+
+删除节点后会显示“清理中”，主控保留节点身份，等待该节点停止实例并确认清理后再移除。离线节点需重新上线完成清理；旧版节点需升级到 v1.1.0 才能确认。通过 HTTPS 代理访问时，在安装命令中选择公共证书校验；直连自签主控时选择固定源站指纹。
+
+## 构建与验证
+
+```bash
+python3 tests/test_forwarding.py
+python3 tests/test_udp.py             # macOS/Linux：真实 UDP 数据报处理
+python3 tests/test_linux.py           # Linux：真实 TCP/UDP、限速、背压及半关闭
+cd panel && go test -race ./... && go vet ./...
+cd frontend && npm ci && npm test && npm run typecheck && npm run build
+```
+
+`build-release.sh` 构建当前前端和三种架构的面板，并生成源码及二进制校验清单。安装器优先源码构建；没有 Go 时只接受清单与当前源码一致的预编译面板。已有旧内核不会仅凭协议开关标记被跳过，必须支持新的 `udp_rate_limit` 能力。

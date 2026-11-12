@@ -283,6 +283,7 @@ reset_kv() {
         [REMOTE_UDP_PORT]=""
         [ENABLE_TCP]=""
         [ENABLE_UDP]=""
+        [RATE_LIMIT_KBPS]=""
         [POOL_SIZE]=""
         [REFILL_BATCH]=""
         [CONNECT_TIMEOUT]=""
@@ -329,7 +330,7 @@ validate_and_write_section() {
     [[ -n "$current" ]] || return 0
 
     local key
-    for key in LOCAL_IP LOCAL_PORT REMOTE_IP REMOTE_TCP_PORT REMOTE_UDP_PORT; do
+    for key in LOCAL_IP LOCAL_PORT REMOTE_IP; do
         if [[ -z "${kv[$key]}" ]]; then
             echo "[$current] 缺少: $key" >&2
             exit 1
@@ -340,18 +341,25 @@ validate_and_write_section() {
         echo "[$current] 不合法 LOCAL_PORT: ${kv[LOCAL_PORT]}" >&2
         exit 1
     }
-    is_valid_port "${kv[REMOTE_TCP_PORT]}" || {
-        echo "[$current] 不合法 REMOTE_TCP_PORT: ${kv[REMOTE_TCP_PORT]}" >&2
-        exit 1
-    }
-    is_valid_port "${kv[REMOTE_UDP_PORT]}" || {
-        echo "[$current] 不合法 REMOTE_UDP_PORT: ${kv[REMOTE_UDP_PORT]}" >&2
-        exit 1
-    }
+    if [[ "${kv[ENABLE_TCP]:-1}" == 1 ]]; then
+        is_valid_port "${kv[REMOTE_TCP_PORT]}" || {
+            echo "[$current] 不合法 REMOTE_TCP_PORT: ${kv[REMOTE_TCP_PORT]}" >&2; exit 1;
+        }
+    fi
+    if [[ "${kv[ENABLE_UDP]:-1}" == 1 ]]; then
+        [[ -n "${kv[REMOTE_UDP_PORT]}" ]] || kv[REMOTE_UDP_PORT]="${kv[REMOTE_TCP_PORT]}"
+        is_valid_port "${kv[REMOTE_UDP_PORT]}" || {
+            echo "[$current] 不合法 REMOTE_UDP_PORT: ${kv[REMOTE_UDP_PORT]}" >&2; exit 1;
+        }
+    fi
+    if [[ "${kv[ENABLE_TCP]:-1}" == 0 && "${kv[ENABLE_UDP]:-1}" == 0 ]]; then
+        echo "[$current] TCP 和 UDP 至少启用一个" >&2; exit 1
+    fi
 
     declare -A ranges=(
         [ENABLE_TCP]="0 1"
         [ENABLE_UDP]="0 1"
+        [RATE_LIMIT_KBPS]="0 10000000"
         [POOL_SIZE]="0 256"
         [REFILL_BATCH]="1 256"
         [CONNECT_TIMEOUT]="1 120"
@@ -396,7 +404,8 @@ validate_and_write_section() {
         printf 'REMOTE_UDP_PORT=%s\n' "${kv[REMOTE_UDP_PORT]}"
         printf 'ENABLE_TCP=%s\n' "${kv[ENABLE_TCP]:-1}"
         printf 'ENABLE_UDP=%s\n' "${kv[ENABLE_UDP]:-1}"
-        for opt in POOL_SIZE REFILL_BATCH CONNECT_TIMEOUT IDLE_TIMEOUT HALF_CLOSE_TIMEOUT PRECONNECT_TTL_MS SPLICE_CHUNK UDP_IDLE_TIMEOUT UDP_SOCKET_BUFFER LISTEN_BACKLOG LOG_ENABLE LOG_RATE_PER_SEC TCP_KEEPIDLE TCP_KEEPINTVL TCP_KEEPCNT TCP_USER_TIMEOUT_MS; do
+        printf 'STATS_FILE=/run/tcp-pool/%s.stats.json\n' "$current"
+        for opt in RATE_LIMIT_KBPS POOL_SIZE REFILL_BATCH CONNECT_TIMEOUT IDLE_TIMEOUT HALF_CLOSE_TIMEOUT PRECONNECT_TTL_MS SPLICE_CHUNK UDP_IDLE_TIMEOUT UDP_SOCKET_BUFFER LISTEN_BACKLOG LOG_ENABLE LOG_RATE_PER_SEC TCP_KEEPIDLE TCP_KEEPINTVL TCP_KEEPCNT TCP_USER_TIMEOUT_MS; do
             [[ -z "${kv[$opt]}" ]] && continue
             printf '%s=%s\n' "$opt" "${kv[$opt]}"
         done
@@ -449,7 +458,7 @@ while IFS= read -r raw || [ -n "$raw" ]; do
     fi
 
     case "$key" in
-        LOCAL_IP|LOCAL_PORT|REMOTE_IP|REMOTE_TCP_PORT|REMOTE_UDP_PORT|ENABLE_TCP|ENABLE_UDP|POOL_SIZE|REFILL_BATCH|CONNECT_TIMEOUT|IDLE_TIMEOUT|HALF_CLOSE_TIMEOUT|PRECONNECT_TTL_MS|SPLICE_CHUNK|UDP_IDLE_TIMEOUT|UDP_SOCKET_BUFFER|LISTEN_BACKLOG|LOG_ENABLE|LOG_RATE_PER_SEC|TCP_KEEPIDLE|TCP_KEEPINTVL|TCP_KEEPCNT|TCP_USER_TIMEOUT_MS)
+        LOCAL_IP|LOCAL_PORT|REMOTE_IP|REMOTE_TCP_PORT|REMOTE_UDP_PORT|ENABLE_TCP|ENABLE_UDP|RATE_LIMIT_KBPS|POOL_SIZE|REFILL_BATCH|CONNECT_TIMEOUT|IDLE_TIMEOUT|HALF_CLOSE_TIMEOUT|PRECONNECT_TTL_MS|SPLICE_CHUNK|UDP_IDLE_TIMEOUT|UDP_SOCKET_BUFFER|LISTEN_BACKLOG|LOG_ENABLE|LOG_RATE_PER_SEC|TCP_KEEPIDLE|TCP_KEEPINTVL|TCP_KEEPCNT|TCP_USER_TIMEOUT_MS)
             kv["$key"]="$val"
             ;;
         *)
