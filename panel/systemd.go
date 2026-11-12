@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -40,6 +42,12 @@ StandardError=journal
 WantedBy=multi-user.target
 `
 
+func serviceTemplateFor(p Paths) string {
+	bin := strings.NewReplacer("%", "%%", "$", "$$").Replace(p.TCPPoolBin)
+	s := strings.Replace(serviceTemplate, "ExecStart=/root/tcp_pool", "ExecStart="+strconv.Quote(bin), 1)
+	return strings.Replace(s, "EnvironmentFile=/etc/tcp_pool/%i.conf", "EnvironmentFile="+strconv.Quote(filepath.Join(strings.ReplaceAll(p.ConfDir, "%", "%%"), "%i.conf")), 1)
+}
+
 // EnvFileContent 生成 systemd EnvironmentFile 内容，键与底层 tcp_pool.c 一致。
 func (m *SystemdManager) EnvFileContent(r *Rule) string {
 	var b strings.Builder
@@ -76,6 +84,7 @@ func relaysMirror(rules []*Rule) string {
 		fmt.Fprintf(&b, "REMOTE_UDP_PORT=%d\n", r.RemoteUDPPort)
 		fmt.Fprintf(&b, "ENABLE_TCP=%d\n", b2i(r.EnableTCP))
 		fmt.Fprintf(&b, "ENABLE_UDP=%d\n", b2i(r.EnableUDP))
+		fmt.Fprintf(&b, "RATE_LIMIT_KBPS=%d\n", r.RateLimitKBps)
 		for _, k := range advancedOrder {
 			if v, ok := r.Advanced[k]; ok {
 				fmt.Fprintf(&b, "%s=%d\n", k, v)
@@ -155,13 +164,28 @@ func (m *SystemdManager) RestartRule(tag string) error {
 	return err
 }
 
+// Explicit starts begin a fresh quota counter; remove the old snapshot while stopped.
+func (m *SystemdManager) RestartRuleFresh(tag string) error {
+	if err := m.StopRule(tag); err != nil {
+		return err
+	}
+	if !m.run.DryRun {
+		if err := rmFile(statsPath(tag)); err != nil {
+			return err
+		}
+	}
+	return m.RestartRule(tag)
+}
+
 func (m *SystemdManager) StopRule(tag string) error {
 	_, _, err := m.run.Run("systemctl", "disable", "--now", m.unit(tag))
 	return err
 }
 
 func (m *SystemdManager) DeleteUnit(tag string) error {
-	_, _, _ = m.run.Run("systemctl", "disable", "--now", m.unit(tag))
+	if err := m.StopRule(tag); err != nil {
+		return err
+	}
 	_, _, _ = m.run.Run("systemctl", "reset-failed", m.unit(tag))
 	return nil
 }

@@ -1,67 +1,85 @@
-import { useEffect, useState } from "react";
-import { api, type TrafficData } from "@/api";
-import { fmtBytes } from "@/lib/utils";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { useCallback, useMemo, useState } from "react";
+import { ArrowDownToLine, ArrowUpFromLine, BarChart3, Database, PlugZap } from "lucide-react";
+import { api, type NodeInfo, type TrafficData } from "@/api";
+import { cn, fmtBytes, fmtNumber } from "@/lib/utils";
+import { usePolling } from "@/lib/usePolling";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { TrafficBar } from "@/components/ui/progress";
-import { ArrowDownToLine, ArrowUpFromLine, Database, PlugZap } from "lucide-react";
-import {
-  ResponsiveContainer, AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
-} from "recharts";
+import { Skeleton } from "@/components/ui/misc";
+import { Tooltip } from "@/components/ui/tooltip";
+import { EmptyState, ErrorBanner, PageHeader, StatCard } from "@/components/common";
+import { ChartLegend, TrafficChart } from "@/components/traffic-chart";
 
-const RANGES: [string, string][] = [["24h", "今天"], ["7d", "近 7 天"], ["30d", "近 30 天"], ["365d", "全年"]];
+const RANGES: [string, string, string][] = [
+  ["24h", "24 小时", "每小时"], ["7d", "7 天", "每天"], ["30d", "30 天", "每天"], ["365d", "一年", "每周"],
+];
 
-function heatColor(v: number, max: number): string {
-  if (v <= 0) return "hsl(240 3.7% 15.9%)";
-  const r = v / max;
-  if (r < 0.25) return "rgba(59,130,246,.28)";
-  if (r < 0.5) return "rgba(59,130,246,.5)";
-  if (r < 0.75) return "rgba(59,130,246,.72)";
-  return "rgb(59,130,246)";
+const dayKey = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const LEVELS = ["bg-muted", "bg-primary/25", "bg-primary/45", "bg-primary/70", "bg-primary"];
+
+// 按分位数分级：个别极端日不会把其它日期都压成最浅色
+function level(v: number, q: number[]) {
+  if (v <= 0) return 0;
+  return v <= q[0] ? 1 : v <= q[1] ? 2 : v <= q[2] ? 3 : 4;
 }
 
 function Heatmap({ days }: { days: { date: string; up: number; down: number }[] }) {
-  const map = new Map(days.map((d) => [d.date, d.up + d.down]));
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  const end = new Date(today); end.setDate(end.getDate() + (6 - end.getDay()));
-  const start = new Date(end); start.setDate(start.getDate() - 52 * 7);
-  const weeks = Math.ceil((+end - +start) / 7 / 86400000);
-  const vals = [...map.values()].filter((v) => v > 0);
-  const max = Math.max(...vals, 1);
-  const monthLabels: { left: number; label: string }[] = [];
-  let lastMonth = -1;
-  const cells: JSX.Element[] = [];
-
-  for (let w = 0; w < weeks; w++) {
-    const col: JSX.Element[] = [];
-    for (let dow = 0; dow < 7; dow++) {
-      const day = new Date(start); day.setDate(day.getDate() + w * 7 + dow);
-      if (day > today) { col.push(<div key={dow} className="h-[11px] w-[11px] rounded-[3px]" />); continue; }
-      const key = `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
-      const v = map.get(key) || 0;
-      if (dow === 0 && day.getMonth() !== lastMonth) {
-        lastMonth = day.getMonth();
-        monthLabels.push({ left: w * 14, label: `${day.getMonth() + 1}月` });
+  const { weeks, months, quartiles, total, activeDays } = useMemo(() => {
+    const map = new Map(days.map((d) => [d.date, d.up + d.down]));
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const end = new Date(today); end.setDate(end.getDate() + (6 - end.getDay()));
+    const start = new Date(end); start.setDate(start.getDate() - 53 * 7 + 1);
+    const vals = [...map.values()].filter((v) => v > 0).sort((a, b) => a - b);
+    const at = (p: number) => vals[Math.min(vals.length - 1, Math.floor(vals.length * p))] || 0;
+    const weeks: { key: string; v: number; future: boolean }[][] = [];
+    const months: { col: number; label: string }[] = [];
+    let lastMonth = -1;
+    for (let w = 0; w < 53; w++) {
+      const col = [];
+      for (let dow = 0; dow < 7; dow++) {
+        const day = new Date(start); day.setDate(start.getDate() + w * 7 + dow);
+        const key = dayKey(day);
+        if (dow === 0 && day.getMonth() !== lastMonth) {
+          lastMonth = day.getMonth();
+          // 起始列只露出几天的月份不标注，避免与下个月的标签重叠
+          if (months.length && w - months[months.length - 1].col < 3) months.pop();
+          months.push({ col: w, label: `${day.getMonth() + 1}月` });
+        }
+        col.push({ key, v: map.get(key) || 0, future: day > today });
       }
-      col.push(<div key={dow} title={`${key} · ${fmtBytes(v)}`} className="h-[11px] w-[11px] rounded-[3px]" style={{ background: heatColor(v, max) }} />);
+      weeks.push(col);
     }
-    cells.push(<div key={w} className="flex flex-col gap-[3px]">{col}</div>);
-  }
+    return { weeks, months, quartiles: [at(0.25), at(0.5), at(0.75)], total: vals.reduce((a, b) => a + b, 0), activeDays: vals.length };
+  }, [days]);
+
   return (
-    <div className="overflow-x-auto pb-1">
-      <div className="relative mb-1.5 h-4" style={{ minWidth: weeks * 14 }}>
-        {monthLabels.map((m, i) => (
-          <span key={i} className="absolute text-[10.5px] text-muted-foreground" style={{ left: m.left }}>{m.label}</span>
-        ))}
+    <div>
+      <div className="overflow-x-auto pb-2">
+        <div className="inline-grid gap-y-1.5" style={{ gridTemplateColumns: "auto 1fr" }}>
+          <div />
+          <div className="relative h-4 text-[11px] text-muted-foreground">
+            {months.map((m) => <span key={m.col} className="absolute" style={{ left: m.col * 15 }}>{m.label}</span>)}
+          </div>
+          <div className="grid grid-rows-7 gap-[3px] pr-2 text-[10px] leading-3 text-muted-foreground">
+            {["", "一", "", "三", "", "五", ""].map((d, i) => <span key={i} className="h-3">{d}</span>)}
+          </div>
+          <div className="flex gap-[3px]">
+            {weeks.map((col, w) => (
+              <div key={w} className="grid grid-rows-7 gap-[3px]">
+                {col.map((c) => c.future ? <div key={c.key} className="h-3 w-3" /> : (
+                  <Tooltip key={c.key} content={`${c.key} · ${fmtBytes(c.v)}`}>
+                    <div className={cn("h-3 w-3 rounded-[3px] ring-1 ring-inset ring-black/[0.04] transition-transform hover:scale-125 dark:ring-white/[0.04]", LEVELS[level(c.v, quartiles)])} />
+                  </Tooltip>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
-      <div className="flex gap-[3px]">{cells}</div>
-      <div className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-        少
-        {[0, 0.15, 0.4, 0.65, 1].map((r) => (
-          <div key={r} className="h-[11px] w-[11px] rounded-[3px]" style={{ background: r === 0 ? heatColor(0, 1) : heatColor(r * 100, 100) }} />
-        ))}
-        多
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground">
+        <span>过去一年共 <b className="tabular font-medium text-foreground">{fmtBytes(total)}</b>，有流量 {activeDays} 天</span>
+        <span className="flex items-center gap-1.5">少{LEVELS.map((c) => <i key={c} className={cn("h-3 w-3 rounded-[3px]", c)} />)}多</span>
       </div>
     </div>
   );
@@ -69,160 +87,110 @@ function Heatmap({ days }: { days: { date: string; up: number; down: number }[] 
 
 export function Traffic() {
   const [range, setRange] = useState("24h");
-  const [d, setD] = useState<TrafficData | null>(null);
   const [groupMode, setGroupMode] = useState<"rule" | "node">("rule");
 
-  useEffect(() => {
-    api<TrafficData>(`/api/traffic?range=${range}`).then(setD).catch(() => {});
-  }, [range]);
+  const request = useCallback((signal: AbortSignal) => api<TrafficData>(`/api/traffic?range=${range}`, { signal }), [range]);
+  const nodesReq = useCallback((signal: AbortSignal) => api<{ nodes: NodeInfo[] }>("/api/nodes", { signal }).then((d) => d.nodes || []), []);
+  const { data, error } = usePolling(request, 30000);
+  const { data: nodes } = usePolling(nodesReq, 60000);
+  const d = data && data.range === range ? data : null;
+  const nodeName = useCallback((id: number) => (id === 0 ? "本机" : nodes?.find((n) => n.id === id)?.name || `节点 #${id}`), [nodes]);
 
-  if (!d) return <div className="py-16 text-center text-sm text-muted-foreground">加载中…</div>;
-  const totals = d.totals;
-
-  let groups: { tag: string; node_id: number; up: number; down: number; conns: number }[] = [];
-  if (groupMode === "node") {
-    const m = new Map<number, typeof groups[number]>();
+  const groups = useMemo(() => {
+    if (!d) return [];
+    if (groupMode === "rule") return [...d.rows].sort((a, b) => b.up + b.down - (a.up + a.down)).map((r) => ({ ...r, name: r.tag, sub: nodeName(r.node_id) }));
+    const m = new Map<number, { name: string; sub: string; node_id: number; up: number; down: number; conns: number; count: number }>();
     for (const r of d.rows) {
-      const g = m.get(r.node_id) || { tag: r.node_id === 0 ? "本机" : `节点 #${r.node_id}`, node_id: r.node_id, up: 0, down: 0, conns: 0 };
-      g.up += r.up; g.down += r.down; g.conns += r.conns;
+      const g = m.get(r.node_id) || { name: nodeName(r.node_id), sub: "", node_id: r.node_id, up: 0, down: 0, conns: 0, count: 0 };
+      g.up += r.up; g.down += r.down; g.conns += r.conns; g.count++;
       m.set(r.node_id, g);
     }
-    groups = [...m.values()].sort((a, b) => b.up + b.down - (a.up + a.down));
-  } else {
-    groups = d.rows;
-  }
+    return [...m.values()].map((g) => ({ ...g, sub: `${g.count} 条转发` })).sort((a, b) => b.up + b.down - (a.up + a.down));
+  }, [d, groupMode, nodeName]);
   const grand = groups.reduce((s, g) => s + g.up + g.down, 0) || 1;
-
-  const chartData = d.points.map((p) => ({
-    t: p.t * 1000,
-    down: p.down,
-    total: p.up + p.down,
-    upText: fmtBytes(p.up),
-    downText: fmtBytes(p.down),
-  }));
-  const fmtTime = (v: number) => {
-    const t = new Date(v);
-    return range === "24h" ? `${t.getHours()}:00` : range === "7d" ? `${t.getMonth() + 1}/${t.getDate()} ${t.getHours()}时` : `${t.getMonth() + 1}/${t.getDate()}`;
-  };
+  const rangeInfo = RANGES.find(([k]) => k === range)!;
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-xl font-semibold tracking-tight">流量统计</h2>
-          <p className="mt-1 text-xs text-muted-foreground">基于转发内核计数采样（每分钟），5 分钟粒度聚合，保留 48h 明细 + 400 天日汇总</p>
-        </div>
-        <Tabs value={range} onValueChange={setRange}>
-          <TabsList>
-            {RANGES.map(([k, label]) => <TabsTrigger key={k} value={k}>{label}</TabsTrigger>)}
-          </TabsList>
-        </Tabs>
-      </div>
-
-      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-        <Card><CardContent className="flex items-center gap-3 p-4">
-          <ArrowDownToLine className="h-8 w-8 text-blue-500" />
-          <div><div className="text-xs text-muted-foreground">下载（远端→客户端）</div><div className="text-lg font-semibold">{fmtBytes(totals.down)}</div></div>
-        </CardContent></Card>
-        <Card><CardContent className="flex items-center gap-3 p-4">
-          <ArrowUpFromLine className="h-8 w-8 text-emerald-500" />
-          <div><div className="text-xs text-muted-foreground">上传（客户端→远端）</div><div className="text-lg font-semibold">{fmtBytes(totals.up)}</div></div>
-        </CardContent></Card>
-        <Card><CardContent className="flex items-center gap-3 p-4">
-          <Database className="h-8 w-8 text-violet-500" />
-          <div><div className="text-xs text-muted-foreground">合计流量</div><div className="text-lg font-semibold">{fmtBytes(totals.up + totals.down)}</div></div>
-        </CardContent></Card>
-        <Card><CardContent className="flex items-center gap-3 p-4">
-          <PlugZap className="h-8 w-8 text-amber-500" />
-          <div><div className="text-xs text-muted-foreground">新建连接</div><div className="text-lg font-semibold">{totals.conns} <span className="text-xs font-normal text-muted-foreground">次</span></div></div>
-        </CardContent></Card>
-      </div>
-
-      <Card>
-        <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
-          <CardTitle className="text-sm">流量趋势</CardTitle>
-          <div className="flex gap-4 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-sm bg-blue-500" />下载</span>
-            <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-sm bg-emerald-500" />上传</span>
-          </div>
-        </CardHeader>
-        <CardContent>
-          <div className="h-[260px]">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 8, right: 8, left: 52, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="gDown" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.35} />
-                    <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
-                  </linearGradient>
-                  <linearGradient id="gTotal" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" stopColor="#22c55e" stopOpacity={0.22} />
-                    <stop offset="100%" stopColor="#22c55e" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(139,151,179,.15)" />
-                <XAxis dataKey="t" tickFormatter={fmtTime} tick={{ fill: "#8b97b3", fontSize: 11 }} axisLine={false} tickLine={false} minTickGap={40} />
-                <YAxis tickFormatter={(v) => fmtBytes(v).replace(" ", "")} tick={{ fill: "#8b97b3", fontSize: 11 }} axisLine={false} tickLine={false} width={50} />
-                <Tooltip
-                  contentStyle={{ background: "hsl(240 10% 5.9%)", border: "1px solid hsl(240 3.7% 15.9%)", borderRadius: 8, fontSize: 12 }}
-                  labelFormatter={(v) => fmtTime(Number(v))}
-                  formatter={(value: any, name: any) => [fmtBytes(Number(value)), name === "total" ? "上传+下载" : "下载"]}
-                />
-                <Area type="monotone" dataKey="down" stroke="#3b82f6" strokeWidth={2} fill="url(#gDown)" />
-                <Area type="monotone" dataKey="total" stroke="#22c55e" strokeWidth={2} fill="url(#gTotal)" name="total" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader className="pb-2"><CardTitle className="text-sm">年度热力图</CardTitle></CardHeader>
-        <CardContent><Heatmap days={d.heatmap} /></CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
-          <CardTitle className="text-sm">分组统计（本期）</CardTitle>
-          <Tabs value={groupMode} onValueChange={(v) => setGroupMode(v as any)}>
-            <TabsList>
-              <TabsTrigger value="rule">按转发</TabsTrigger>
-              <TabsTrigger value="node">按节点</TabsTrigger>
-            </TabsList>
+    <div>
+      <PageHeader
+        title="流量统计"
+        description="基于转发内核计数每分钟采样，按时间范围聚合 TCP 与 UDP 用量，日汇总保留 400 天。"
+        actions={
+          <Tabs value={range} onValueChange={setRange}>
+            <TabsList>{RANGES.map(([k, label]) => <TabsTrigger key={k} value={k}>{label}</TabsTrigger>)}</TabsList>
           </Tabs>
+        }
+      />
+      <ErrorBanner message={error} />
+
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard icon={ArrowDownToLine} label="下载" hint="远端 → 客户端" value={d ? fmtBytes(d.totals.down) : <Skeleton className="h-8 w-24" />} />
+        <StatCard icon={ArrowUpFromLine} accent="chart-2" label="上传" hint="客户端 → 远端" value={d ? fmtBytes(d.totals.up) : <Skeleton className="h-8 w-24" />} />
+        <StatCard icon={Database} accent="info" label="合计" hint={`近 ${rangeInfo[1]}`} value={d ? fmtBytes(d.totals.up + d.totals.down) : <Skeleton className="h-8 w-24" />} />
+        <StatCard icon={PlugZap} accent="warning" label="新建连接" hint="TCP 连接 + UDP 会话" value={d ? fmtNumber(d.totals.conns) : <Skeleton className="h-8 w-24" />} />
+      </div>
+
+      <Card className="mt-4">
+        <CardHeader className="flex-row flex-wrap items-start justify-between gap-4 space-y-0">
+          <div className="space-y-1"><CardTitle>流量趋势</CardTitle><CardDescription>近 {rangeInfo[1]} · {rangeInfo[2]}汇总</CardDescription></div>
+          <ChartLegend />
         </CardHeader>
-        <CardContent className="px-0 pb-0">
-          <Table>
-            <TableHeader><TableRow>
-              <TableHead>名称</TableHead><TableHead>节点</TableHead><TableHead>下载</TableHead>
-              <TableHead>上传</TableHead><TableHead>合计</TableHead><TableHead className="w-56">占比</TableHead><TableHead>连接</TableHead>
-            </TableRow></TableHeader>
-            <TableBody>
-              {groups.length === 0 && (
-                <TableRow><TableCell colSpan={7}><div className="py-10 text-center text-sm text-muted-foreground">本期没有流量数据</div></TableCell></TableRow>
-              )}
-              {groups.map((g) => {
-                const v = g.up + g.down;
-                const pct = (v / grand) * 100;
-                return (
-                  <TableRow key={g.tag}>
-                    <TableCell className="font-medium">{g.tag}</TableCell>
-                    <TableCell>{groupMode === "rule" ? (g.node_id === 0 ? "本机" : `#${g.node_id}`) : "-"}</TableCell>
-                    <TableCell className="font-mono text-xs">{fmtBytes(g.down)}</TableCell>
-                    <TableCell className="font-mono text-xs">{fmtBytes(g.up)}</TableCell>
-                    <TableCell className="font-mono text-xs font-semibold">{fmtBytes(v)}</TableCell>
-                    <TableCell>
-                      <TrafficBar pct={pct} />
-                      <div className="mt-1 text-[11px] text-muted-foreground">{pct.toFixed(1)}%</div>
-                    </TableCell>
-                    <TableCell className="font-mono text-xs">{g.conns}</TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        </CardContent>
+        <CardContent className="pl-2">{d ? <TrafficChart points={d.points} range={range} height={300} /> : <Skeleton className="ml-3 h-[300px]" />}</CardContent>
       </Card>
+
+      <div className="mt-4 grid gap-4 2xl:grid-cols-[auto_1fr]">
+        <Card className="min-w-0">
+          <CardHeader><CardTitle>年度热力图</CardTitle><CardDescription>每日上传 + 下载合计</CardDescription></CardHeader>
+          <CardContent>{d ? <Heatmap days={d.heatmap} /> : <Skeleton className="h-32" />}</CardContent>
+        </Card>
+
+        <Card className="min-w-0 overflow-hidden">
+          <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 space-y-0">
+            <div className="space-y-1"><CardTitle>分组统计</CardTitle><CardDescription>近 {rangeInfo[1]}，按用量排序</CardDescription></div>
+            <Tabs value={groupMode} onValueChange={(v) => setGroupMode(v as "rule" | "node")}>
+              <TabsList><TabsTrigger value="rule">按转发</TabsTrigger><TabsTrigger value="node">按节点</TabsTrigger></TabsList>
+            </Tabs>
+          </CardHeader>
+          {!d ? <CardContent><Skeleton className="h-40" /></CardContent> : groups.length === 0 ? (
+            <EmptyState icon={BarChart3} title="本期没有流量数据" description="转发产生流量后，约 1 分钟内出现在这里" />
+          ) : (
+            <Table>
+              <TableHeader><TableRow className="hover:bg-transparent">
+                <TableHead>{groupMode === "rule" ? "转发" : "节点"}</TableHead>
+                <TableHead className="text-right">下载</TableHead>
+                <TableHead className="text-right">上传</TableHead>
+                <TableHead className="text-right">合计</TableHead>
+                <TableHead className="w-48">占比</TableHead>
+                <TableHead className="text-right">连接</TableHead>
+              </TableRow></TableHeader>
+              <TableBody>
+                {groups.map((g) => {
+                  const v = g.up + g.down;
+                  const pct = (v / grand) * 100;
+                  return (
+                    <TableRow key={g.name + g.node_id}>
+                      <TableCell><div className="font-medium">{g.name}</div><div className="text-xs text-muted-foreground">{g.sub}</div></TableCell>
+                      <TableCell className="tabular text-right font-mono text-xs">{fmtBytes(g.down)}</TableCell>
+                      <TableCell className="tabular text-right font-mono text-xs">{fmtBytes(g.up)}</TableCell>
+                      <TableCell className="tabular text-right font-mono text-xs font-semibold">{fmtBytes(v)}</TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2.5">
+                          <div className="flex h-1.5 flex-1 overflow-hidden rounded-full bg-muted">
+                            <div className="h-full bg-chart-1" style={{ width: `${(g.down / grand) * 100}%` }} />
+                            <div className="h-full bg-chart-2" style={{ width: `${(g.up / grand) * 100}%` }} />
+                          </div>
+                          <span className="tabular w-11 text-right text-xs text-muted-foreground">{pct.toFixed(1)}%</span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="tabular text-right font-mono text-xs">{fmtNumber(g.conns)}</TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </Card>
+      </div>
     </div>
   );
 }

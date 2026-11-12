@@ -11,7 +11,7 @@ export interface Rule {
   status: UnitStatus; stats: RuleStats; probe?: ProbeResult | null; owner: string; node_name: string; my_rule: boolean;
 }
 export interface NodeInfo {
-  id: number; name: string; key?: string; online: boolean; last_seen: string; rule_count: number;
+  id: number; name: string; key?: string; online: boolean; deleting?: boolean; last_seen: string; rule_count: number;
   report: { at: string; machine: MachineInfo; tcp_pool: string; panel: string; statuses: Record<string, UnitStatus>; stats?: Record<string, RuleStats> };
 }
 export interface MachineInfo { kernel?: string; hostname?: string; os?: string; cpu_cores?: number; load_avg?: string; mem_total?: number; mem_avail?: number }
@@ -25,19 +25,22 @@ export interface TrafficRow { tag: string; node_id: number; up: number; down: nu
 export interface TrafficData { range: string; points: TrafficPoint[]; rows: TrafficRow[]; heatmap: { date: string; up: number; down: number }[]; totals: { up: number; down: number; conns: number } }
 export interface Overview {
   rules_total: number; rules_running: number; rules_stopped: number;
-  nodes_total: number; nodes_online: number; users_total: number;
-  traffic_total: number; over_quota: string[]; machine: MachineInfo; version: string; tuning?: TuningStatus;
+  nodes_total: number; nodes_online: number;
+  traffic_total: number; over_quota: string[]; version: string;
+  // 以下字段仅管理员返回
+  users_total?: number; machine?: MachineInfo; tuning?: TuningStatus;
 }
 
 export type ApiError = { error: string };
 let onUnauthorized: (() => void) | null = null;
 export function setOnUnauthorized(fn: () => void) { onUnauthorized = fn; }
 
-export async function api<T = any>(path: string, opts: { method?: string; body?: any } = {}): Promise<T> {
+export async function api<T = any>(path: string, opts: { method?: string; body?: any; signal?: AbortSignal } = {}): Promise<T> {
   const res = await fetch(path, {
     method: opts.method || (opts.body ? "POST" : "GET"),
     headers: opts.body ? { "Content-Type": "application/json" } : undefined,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
+    signal: opts.signal,
   });
   const data = await res.json().catch(() => ({}) as any);
   if (res.status === 401) {
@@ -68,14 +71,6 @@ export const ADV: [string, string, number, string][] = [
   ["TCP_USER_TIMEOUT_MS", "未确认数据等待(ms)", 0, "0-3600000"],
 ];
 
-export function statusBadgeVariant(active?: string): { variant: string; text: string } {
-  switch (active) {
-    case "active": return { variant: "success", text: "运行中" };
-    case "failed": return { variant: "destructive", text: "失败" };
-    case "inactive": return { variant: "secondary", text: "已停止" };
-    case "activating": return { variant: "warning", text: "启动中" };
-    case "pending": return { variant: "warning", text: "待节点上报" };
-    case "node-offline": return { variant: "destructive", text: "节点离线" };
-    default: return { variant: "secondary", text: active || "未知" };
-  }
+export function errMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }

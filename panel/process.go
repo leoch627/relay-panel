@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,6 +36,16 @@ type procEntry struct {
 	cmd      *exec.Cmd
 	started  time.Time
 	restarts int
+	done     chan struct{}
+}
+
+func (e *procEntry) alive() bool {
+	select {
+	case <-e.done:
+		return false
+	default:
+		return true
+	}
 }
 
 func NewProcessManager(run *Runner, p Paths) *ProcessManager {
@@ -96,44 +107,54 @@ func (m *ProcessManager) startLocked(tag string) error {
 		logf.Close()
 		return err
 	}
-	entry := &procEntry{cmd: cmd, started: time.Now()}
+	entry := &procEntry{cmd: cmd, started: time.Now(), done: make(chan struct{})}
 	m.children[tag] = entry
 	// 回收退出进程，避免僵尸；异常退出留在 map 里由 ensureAlive 处理
 	go func() {
 		_ = cmd.Wait()
 		logf.Close()
+		close(entry.done)
 	}()
 	return nil
 }
 
-func (m *ProcessManager) killLocked(tag string) {
+func (m *ProcessManager) killLocked(tag string) error {
 	if e, ok := m.children[tag]; ok {
-		if e.cmd.Process != nil {
-			_ = e.cmd.Process.Signal(syscall.SIGTERM)
-			done := make(chan struct{})
-			go func() { _ = e.cmd.Wait(); close(done) }()
+		if e.alive() {
+			if err := e.cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				return err
+			}
 			select {
-			case <-done:
+			case <-e.done:
 			case <-time.After(3 * time.Second):
-				_ = e.cmd.Process.Kill()
+				if err := e.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+					return err
+				}
+				select {
+				case <-e.done:
+				case <-time.After(3 * time.Second):
+					return fmt.Errorf("等待实例 %s 退出超时", tag)
+				}
 			}
 		}
 		delete(m.children, tag)
 	}
+	return nil
 }
 
 func (m *ProcessManager) RestartRule(tag string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.killLocked(tag)
+	if err := m.killLocked(tag); err != nil {
+		return err
+	}
 	return m.startLocked(tag)
 }
 
 func (m *ProcessManager) StopRule(tag string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.killLocked(tag)
-	return nil
+	return m.killLocked(tag)
 }
 
 func (m *ProcessManager) DeleteUnit(tag string) error {
@@ -143,7 +164,7 @@ func (m *ProcessManager) DeleteUnit(tag string) error {
 func (m *ProcessManager) Status(tag string) UnitStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if e, ok := m.children[tag]; ok && e.cmd.ProcessState == nil {
+	if e, ok := m.children[tag]; ok && e.alive() {
 		st := UnitStatus{
 			Active:    "active",
 			Enabled:   "enabled",
@@ -161,7 +182,7 @@ func (m *ProcessManager) Alive(tag string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.children[tag]
-	return ok && e.cmd.ProcessState == nil
+	return ok && e.alive()
 }
 
 // EnsureAlive 期望 running 的实例若不在（崩溃/被杀）则重启；带最短间隔防抖。
@@ -169,13 +190,15 @@ func (m *ProcessManager) EnsureAlive(tag string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.children[tag]
-	if ok && e.cmd.ProcessState == nil {
+	if ok && e.alive() {
 		return
 	}
 	if ok && time.Since(e.started) < 5*time.Second {
 		return // 启动即崩的兜底节流
 	}
-	m.killLocked(tag)
+	if err := m.killLocked(tag); err != nil {
+		return
+	}
 	if err := m.startLocked(tag); err == nil && ok {
 		if ne := m.children[tag]; ne != nil {
 			ne.restarts = e.restarts + 1

@@ -4,33 +4,82 @@
 
 @layer base {
   :root {
-    --background: 240 10% 3.9%;
-    --foreground: 0 0% 98%;
-    --card: 240 10% 5.9%;
-    --card-foreground: 0 0% 98%;
-    --popover: 240 10% 3.9%;
-    --popover-foreground: 0 0% 98%;
-    /* 品牌主色：蓝 */
-    --primary: 217 91% 60%;
+    --background: 220 23% 97%;
+    --foreground: 224 28% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 28% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 224 28% 12%;
+    --sidebar: 0 0% 100%;
+    /* 品牌主色：靛蓝 */
+    --primary: 243 75% 59%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 240 3.7% 15.9%;
-    --secondary-foreground: 0 0% 98%;
-    --muted: 240 3.7% 15.9%;
-    --muted-foreground: 240 5% 64.9%;
-    --accent: 240 3.7% 15.9%;
-    --accent-foreground: 0 0% 98%;
-    --destructive: 0 62.8% 50%;
-    --destructive-foreground: 0 0% 98%;
-    --border: 240 3.7% 15.9%;
-    --input: 240 3.7% 15.9%;
-    --ring: 240 4.9% 83.9%;
-    --radius: 0.5rem;
+    --secondary: 220 16% 94%;
+    --secondary-foreground: 224 28% 16%;
+    --muted: 220 18% 95%;
+    --muted-foreground: 220 9% 44%;
+    --accent: 232 40% 95%;
+    --accent-foreground: 243 50% 30%;
+    --destructive: 350 72% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 152 65% 34%;
+    --warning: 32 92% 44%;
+    --info: 199 89% 40%;
+    --border: 220 14% 90%;
+    --input: 220 14% 86%;
+    --ring: 243 75% 59%;
+    --chart-1: 243 75% 59%;
+    --chart-2: 170 72% 38%;
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 228 25% 6%;
+    --foreground: 220 20% 94%;
+    --card: 228 21% 9%;
+    --card-foreground: 220 20% 94%;
+    --popover: 228 21% 10%;
+    --popover-foreground: 220 20% 94%;
+    --sidebar: 228 26% 7.5%;
+    --primary: 241 82% 64%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 228 16% 15%;
+    --secondary-foreground: 220 20% 92%;
+    --muted: 228 16% 13%;
+    --muted-foreground: 222 11% 62%;
+    --accent: 236 24% 17%;
+    --accent-foreground: 230 60% 90%;
+    --destructive: 350 80% 62%;
+    --destructive-foreground: 0 0% 100%;
+    --success: 152 58% 52%;
+    --warning: 38 92% 60%;
+    --info: 199 89% 64%;
+    --border: 228 15% 16%;
+    --input: 228 15% 21%;
+    --ring: 241 82% 66%;
+    --chart-1: 241 85% 70%;
+    --chart-2: 168 66% 50%;
   }
 }
 
 @layer base {
   * { @apply border-border; }
-  html { color-scheme: dark; }
-  body { @apply bg-background text-foreground antialiased; }
-  html, body, #root { height: 100%; }
+  html { color-scheme: light; }
+  html.dark { color-scheme: dark; }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  html, body, #root { min-height: 100%; }
+  ::selection { @apply bg-primary/25; }
+}
+
+@layer utilities {
+  .tabular { font-variant-numeric: tabular-nums; }
+  .bg-grid {
+    background-image:
+      linear-gradient(to right, hsl(var(--border) / 0.6) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--border) / 0.6) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
 }

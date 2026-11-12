@@ -1,185 +1,230 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, type NodeInfo, type Rule } from "@/api";
+import { useCallback, useMemo, useState } from "react";
+import { Waypoints } from "lucide-react";
+import { api, type Rule } from "@/api";
+import { cn } from "@/lib/utils";
+import { usePolling } from "@/lib/usePolling";
+import { ruleDestinations } from "@/lib/ruleDestinations";
+import { probeView, ruleState, toneText } from "@/lib/ruleState";
+import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Card, CardContent } from "@/components/ui/card";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { EmptyState, ErrorBanner, LoadingState, PageHeader, StatusLabel } from "@/components/common";
 
-// cc-switch 风格转发拓扑：客户端 → 中转节点（本机/被控） → 落地机
-// 纯 SVG 绘制，节点卡片与连线状态着色（运行/停止/探测超时）
+// 客户端 → 中转节点（本机/被控） → 落地机；悬停规则或落地高亮对应链路
 
-interface RemoteNode { key: string; host: string; port: number }
+interface Group { id: number; name: string; online: boolean; rules: Rule[] }
+interface Remote { key: string; host: string; port: number; protocols: string[] }
+
+const COL = { client: 0, clientW: 132, node: 220, nodeW: 280, remote: 610, remoteW: 250 };
+const W = COL.remote + COL.remoteW + 2;
+const NODE_HEAD = 50, ROW = 30, NODE_GAP = 18, REMOTE_H = 52, REMOTE_GAP = 12;
+
+type EdgeKind = "run" | "stop" | "fail" | "soft";
+const EDGE: Record<EdgeKind, { color: string; label: string; dash?: string }> = {
+  run: { color: "hsl(var(--primary))", label: "运行" },
+  stop: { color: "hsl(var(--muted-foreground))", label: "停止", dash: "5 5" },
+  fail: { color: "hsl(var(--destructive))", label: "探测超时" },
+  soft: { color: "hsl(var(--warning))", label: "UDP 无响应" },
+};
+
+function edgeKind(r: Rule): EdgeKind {
+  if ((r.desired_state || "running") === "stopped") return "stop";
+  if (r.probe && !r.probe.ok) return r.probe.soft ? "soft" : "fail";
+  return "run";
+}
+
+const curve = (x1: number, y1: number, x2: number, y2: number) => {
+  const dx = (x2 - x1) * 0.5;
+  return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+};
 
 export function Topology() {
-  const [rules, setRules] = useState<Rule[] | null>(null);
-
-  useEffect(() => {
-    api<{ rules: Rule[] }>("/api/rules").then((d) => setRules(d.rules || [])).catch(() => setRules([]));
-  }, []);
+  const request = useCallback((signal: AbortSignal) => api<{ rules: Rule[] }>("/api/rules", { signal }), []);
+  const { data, error } = usePolling(request);
+  const rules = data?.rules;
+  const [hover, setHover] = useState<{ tag?: string; remote?: string; node?: number } | null>(null);
 
   const layout = useMemo(() => {
     if (!rules) return null;
-    // 按节点分组
-    const groups = new Map<string, { id: number; name: string; online: boolean; rules: Rule[] }>();
+    const groups = new Map<number, Group>();
     for (const r of rules) {
-      const g = groups.get(r.node_name) || { id: r.node_id, name: r.node_name, online: r.status.active !== "node-offline", rules: [] };
+      const g = groups.get(r.node_id) || { id: r.node_id, name: r.node_name, online: r.status.active !== "node-offline", rules: [] };
       g.rules.push(r);
-      groups.set(r.node_name, g);
+      groups.set(r.node_id, g);
     }
-    // 落地去重
-    const remotes = new Map<string, RemoteNode>();
+    const nodeList = [...groups.values()].sort((a, b) => a.id - b.id);
+    const remotes = new Map<string, Remote>();
+    const ruleRemotes = new Map<string, string[]>();
     for (const r of rules) {
-      const key = `${r.remote_host}:${r.remote_tcp_port}`;
-      if (!remotes.has(key)) remotes.set(key, { key, host: r.remote_host, port: r.remote_tcp_port });
+      const dests = ruleDestinations(r);
+      ruleRemotes.set(r.tag, dests.map((d) => d.key));
+      for (const d of dests) {
+        const ex = remotes.get(d.key);
+        if (ex) ex.protocols = [...new Set([...ex.protocols, ...d.protocols])];
+        else remotes.set(d.key, { ...d });
+      }
     }
-    const nodeList = [...groups.values()];
     const remoteList = [...remotes.values()];
-    return { nodeList, remoteList, ruleRemote: new Map(rules.map((r) => [r.tag, `${r.remote_host}:${r.remote_tcp_port}`])) };
+
+    const nodeH = (g: Group) => NODE_HEAD + g.rules.length * ROW + 8;
+    const totalNodeH = nodeList.reduce((s, g) => s + nodeH(g) + NODE_GAP, -NODE_GAP);
+    const totalRemoteH = remoteList.length * (REMOTE_H + REMOTE_GAP) - REMOTE_GAP;
+    const H = Math.max(260, totalNodeH, totalRemoteH) + 24;
+
+    let y = (H - totalNodeH) / 2;
+    const nodePos = nodeList.map((g) => { const p = { g, y, h: nodeH(g) }; y += p.h + NODE_GAP; return p; });
+    let ry = (H - totalRemoteH) / 2;
+    const remotePos = new Map(remoteList.map((r) => { const p = { r, y: ry }; ry += REMOTE_H + REMOTE_GAP; return [r.key, p] as const; }));
+    return { nodePos, remotePos, ruleRemotes, H };
   }, [rules]);
 
-  if (!rules || !layout) return <div className="py-16 text-center text-sm text-muted-foreground">加载中…</div>;
+  if (!rules || !layout) return <LoadingState error={error} />;
+  const { nodePos, remotePos, ruleRemotes, H } = layout;
+  const clientY = H / 2;
 
-  // 布局尺寸
-  const nodeH = (g: any) => 56 + g.rules.length * 30;
-  const totalNodeH = layout.nodeList.reduce((s, g) => s + nodeH(g) + 20, 0);
-  const remoteH = 56;
-  const totalRemoteH = layout.remoteList.length * (remoteH + 14) + 14;
-  const H = Math.max(320, Math.max(totalNodeH, totalRemoteH) + 40);
-  const colX = { client: 30, node: 300, remote: 760 };
-  const W = 1120;
-
-  // 计算每个节点卡片 y 与每条规则锚点 y
-  let yCursor = 20;
-  const nodePos = layout.nodeList.map((g) => {
-    const y = yCursor;
-    yCursor += nodeH(g) + 20;
-    return { g, y, h: nodeH(g) };
-  });
-  let ryCursor = (H - totalRemoteH) / 2;
-  const remotePos = layout.remoteList.map((r) => {
-    const y = ryCursor;
-    ryCursor += remoteH + 14;
-    return { r, y };
-  });
-
-  const edgeColor = (r: Rule) => {
-    if ((r.desired_state || "running") === "stopped") return "#64748b";
-    if (r.probe && !r.probe.ok && !r.probe.soft) return "#ef4444";
-    if (r.probe && !r.probe.ok) return "#f59e0b";
-    return "#3b82f6";
+  // 当前悬停涉及的规则集合
+  const active = (r: Rule) => {
+    if (!hover) return true;
+    if (hover.tag) return hover.tag === r.tag;
+    if (hover.remote) return ruleRemotes.get(r.tag)?.includes(hover.remote) ?? false;
+    if (hover.node !== undefined) return r.node_id === hover.node;
+    return true;
   };
-  const edgeDash = (r: Rule) => ((r.desired_state || "running") === "stopped" ? "6 5" : undefined);
+  const remoteActive = (key: string) => !hover || rules.some((r) => active(r) && ruleRemotes.get(r.tag)?.includes(key));
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-xl font-semibold tracking-tight">转发拓扑</h2>
-          <p className="mt-1 text-xs text-muted-foreground">
-            客户端 → 中转节点 → 落地机；连线颜色 = 运行(蓝) / 停止(灰) / 探测超时(红) / UDP 探测无响应(黄)
-          </p>
-        </div>
-        <div className="flex gap-3 text-xs text-muted-foreground">
-          <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-blue-500" />运行</span>
-          <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-slate-500" />停止</span>
-          <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-red-500" />超时</span>
-          <span className="flex items-center gap-1.5"><i className="h-2.5 w-2.5 rounded-full bg-amber-500" />UDP 无响应</span>
-        </div>
-      </div>
+    <div>
+      <PageHeader title="转发拓扑" description="客户端 → 中转节点 → 落地机。悬停规则、节点或落地机可高亮对应链路，落地按 host:port 去重。" />
+      <ErrorBanner message={error} />
 
       {rules.length === 0 ? (
-        <Card><CardContent className="py-14 text-center text-sm text-muted-foreground">还没有转发规则，先到「转发管理」创建</CardContent></Card>
+        <Card><EmptyState icon={Waypoints} title="还没有转发规则" description="先到「转发规则」创建转发，这里会自动绘制链路图。" /></Card>
       ) : (
-        <Card className="overflow-x-auto">
-          <svg width={W} height={H} className="min-w-[900px]">
-            {/* 客户端 */}
-            <rect x={colX.client} y={H / 2 - 28} width={170} height={56} rx={12} className="fill-secondary stroke-border" />
-            <text x={colX.client + 85} y={H / 2 - 4} textAnchor="middle" className="fill-foreground text-[13px] font-medium">客户端</text>
-            <text x={colX.client + 85} y={H / 2 + 14} textAnchor="middle" className="fill-muted-foreground text-[10.5px]">用户流量入口</text>
+        <Card className="overflow-hidden">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b px-5 py-3">
+            <div className="flex items-center gap-4 text-xs text-muted-foreground">
+              {(Object.keys(EDGE) as EdgeKind[]).map((k) => (
+                <span key={k} className="flex items-center gap-1.5">
+                  <svg width="18" height="6"><line x1="0" y1="3" x2="18" y2="3" stroke={EDGE[k].color} strokeWidth="2" strokeDasharray={EDGE[k].dash} /></svg>
+                  {EDGE[k].label}
+                </span>
+              ))}
+            </div>
+            <span className="text-xs text-muted-foreground">{rules.length} 条转发 · {nodePos.length} 个中转 · {remotePos.size} 个落地</span>
+          </div>
+          <div className="bg-grid overflow-x-auto bg-muted/20 p-6 [background-size:24px_24px]">
+            <svg viewBox={`-4 0 ${W + 8} ${H}`} className="mx-auto w-full min-w-[820px] max-w-[1100px] select-none" style={{ height: "auto" }} onMouseLeave={() => setHover(null)}>
+              {/* 边：客户端 → 节点 */}
+              {nodePos.map(({ g, y }) => (
+                <path key={`c-${g.id}`} d={curve(COL.clientW, clientY, COL.node, y + NODE_HEAD / 2)} fill="none"
+                  stroke="hsl(var(--muted-foreground))" strokeWidth={1.5} strokeOpacity={!hover || g.rules.some(active) ? 0.45 : 0.08} className="transition-[stroke-opacity]" />
+              ))}
+              {/* 边：规则 → 落地 */}
+              {nodePos.flatMap(({ g, y }) => g.rules.flatMap((r, i) => {
+                const sy = y + NODE_HEAD + i * ROW + ROW / 2;
+                const k = edgeKind(r);
+                const on = active(r);
+                return (ruleRemotes.get(r.tag) || []).map((key) => {
+                  const rp = remotePos.get(key)!;
+                  const d = curve(COL.node + COL.nodeW, sy, COL.remote, rp.y + REMOTE_H / 2);
+                  return (
+                    <g key={`${r.tag}-${key}`} className="transition-opacity" opacity={on ? 1 : 0.08}>
+                      <path d={d} fill="none" stroke={EDGE[k].color} strokeWidth={hover && on ? 2.4 : 1.6} strokeDasharray={EDGE[k].dash} strokeOpacity={0.85} />
+                      {k === "run" && on && <path d={d} fill="none" stroke={EDGE[k].color} strokeWidth={2} strokeDasharray="2 18" strokeLinecap="round" className="animate-flow" />}
+                    </g>
+                  );
+                });
+              }))}
 
-            {/* 节点卡片 */}
-            {nodePos.map(({ g, y, h }) => {
-              const midY = y + 28;
-              return (
-                <g key={g.name}>
-                  <path d={`M ${colX.client + 170} ${H / 2} C ${colX.client + 240} ${H / 2}, ${colX.node - 60} ${midY}, ${colX.node} ${midY}`}
-                    stroke="#475569" strokeWidth={1.6} fill="none" opacity={0.7} />
-                  <rect x={colX.node} y={y} width={300} height={h} rx={12}
-                    className={g.online || g.id === 0 ? "fill-card stroke-border" : "fill-card stroke-red-500/50"} />
-                  <text x={colX.node + 16} y={y + 24} className="fill-foreground text-[13px] font-semibold">{g.name}</text>
-                  {g.id !== 0 && (
-                    <text x={colX.node + 16} y={y + 40} className="fill-muted-foreground text-[10.5px]">{g.online ? "节点在线" : "节点离线"}</text>
-                  )}
-                  {g.id === 0 && (
-                    <text x={colX.node + 16} y={y + 40} className="fill-muted-foreground text-[10.5px]">主控服务器</text>
-                  )}
-                  {g.rules.map((r, i) => {
-                    const ry = y + 58 + i * 30;
-                    return (
-                      <g key={r.tag}>
-                        <text x={colX.node + 16} y={ry + 4} className="fill-muted-foreground font-mono text-[10.5px]">
-                          {r.tag} :{r.listen_port}
-                        </text>
-                        {r.probe?.ok && (
-                          <text x={colX.node + 284} y={ry + 4} textAnchor="end" className="fill-emerald-400 font-mono text-[10px]">{r.probe.ms}ms</text>
-                        )}
-                      </g>
-                    );
-                  })}
-                </g>
-              );
-            })}
+              {/* 客户端 */}
+              <g>
+                <rect x={COL.client} y={clientY - 30} width={COL.clientW} height={60} rx={14} className="fill-card stroke-border" strokeWidth={1} />
+                <circle cx={COL.client + 26} cy={clientY} r={11} className="fill-primary/10" />
+                <circle cx={COL.client + 26} cy={clientY} r={4} className="fill-primary" />
+                <text x={COL.client + 46} y={clientY - 3} className="fill-foreground text-[13px] font-semibold">客户端</text>
+                <text x={COL.client + 46} y={clientY + 14} className="fill-muted-foreground text-[11px]">用户流量入口</text>
+                <circle cx={COL.clientW} cy={clientY} r={3.5} className="fill-card stroke-muted-foreground" strokeWidth={1.5} />
+              </g>
 
-            {/* 落地卡片 */}
-            {remotePos.map(({ r, y }) => {
-              const midY = y + remoteH / 2;
-              return (
-                <g key={r.key}>
-                  <rect x={colX.remote} y={y} width={300} height={remoteH} rx={12} className="fill-card stroke-border" />
-                  <text x={colX.remote + 16} y={y + 24} className="fill-foreground font-mono text-[12px] font-medium">{r.host}</text>
-                  <text x={colX.remote + 16} y={y + 42} className="fill-muted-foreground font-mono text-[10.5px]">:{r.port}</text>
-                  {/* 规则 → 落地 连线 */}
-                  {nodePos.map(({ g, y: ny, h: nh }) =>
-                    g.rules.filter((rule) => layout.ruleRemote.get(rule.tag) === r.key).map((rule, i) => {
-                      const sy = ny + 58 + g.rules.indexOf(rule) * 30;
+              {/* 中转节点 */}
+              {nodePos.map(({ g, y, h }) => {
+                const on = !hover || g.rules.some(active);
+                const offline = g.id !== 0 && !g.online;
+                return (
+                  <g key={g.id} opacity={on ? 1 : 0.35} className="transition-opacity" onMouseEnter={() => setHover({ node: g.id })}>
+                    <rect x={COL.node} y={y} width={COL.nodeW} height={h} rx={14} className={cn("fill-card", offline ? "stroke-destructive/60" : "stroke-border")} strokeWidth={1} />
+                    <rect x={COL.node} y={y} width={COL.nodeW} height={NODE_HEAD - 6} rx={14} className="fill-muted/50" />
+                    <circle cx={COL.node + 18} cy={y + 22} r={4} className={g.id === 0 ? "fill-primary" : offline ? "fill-destructive" : "fill-success"} />
+                    <text x={COL.node + 30} y={y + 26} className="fill-foreground text-[13px] font-semibold">{g.name}</text>
+                    <text x={COL.node + COL.nodeW - 14} y={y + 26} textAnchor="end" className="fill-muted-foreground text-[11px]">
+                      {g.id === 0 ? "主控" : offline ? "离线" : "在线"} · {g.rules.length}
+                    </text>
+                    <circle cx={COL.node} cy={y + NODE_HEAD / 2} r={3.5} className="fill-card stroke-muted-foreground" strokeWidth={1.5} />
+                    {g.rules.map((r, i) => {
+                      const ry = y + NODE_HEAD + i * ROW;
+                      const pv = probeView(r);
+                      const k = edgeKind(r);
+                      const isHover = hover?.tag === r.tag;
                       return (
-                        <path key={rule.tag}
-                          d={`M ${colX.node + 300} ${sy} C ${colX.node + 380} ${sy}, ${colX.remote - 70} ${midY}, ${colX.remote} ${midY}`}
-                          stroke={edgeColor(rule)} strokeWidth={1.8} strokeDasharray={edgeDash(rule)} fill="none" opacity={0.85} />
+                        <g key={r.tag} onMouseEnter={(e) => { e.stopPropagation(); setHover({ tag: r.tag }); }} onMouseLeave={() => setHover({ node: g.id })} className="cursor-default">
+                          <rect x={COL.node + 6} y={ry + 2} width={COL.nodeW - 12} height={ROW - 4} rx={7} className={isHover ? "fill-accent" : "fill-transparent"} />
+                          <text x={COL.node + 18} y={ry + ROW / 2 + 4} className="fill-foreground font-mono text-[11.5px] font-medium">{r.tag}</text>
+                          <text x={COL.node + 132} y={ry + ROW / 2 + 4} className="fill-muted-foreground font-mono text-[11px]">:{r.listen_port}</text>
+                          {pv && <text x={COL.node + COL.nodeW - 18} y={ry + ROW / 2 + 4} textAnchor="end" className={cn("font-mono text-[10.5px]", pv.tone === "success" ? "fill-success" : pv.tone === "warning" ? "fill-warning" : "fill-destructive")}>{pv.label}</text>}
+                          <circle cx={COL.node + COL.nodeW} cy={ry + ROW / 2} r={3.5} fill={EDGE[k].color} className="stroke-card" strokeWidth={1.5} />
+                        </g>
                       );
-                    })
-                  )}
-                </g>
-              );
-            })}
+                    })}
+                  </g>
+                );
+              })}
 
-            {/* 图例注释 */}
-            <text x={colX.remote + 310} y={24} className="fill-muted-foreground text-[10px]">按 tag:监听端口 出边，落地按 host:port 去重</text>
-          </svg>
+              {/* 落地机 */}
+              {[...remotePos.values()].map(({ r, y }) => {
+                const on = remoteActive(r.key);
+                return (
+                  <g key={r.key} opacity={on ? 1 : 0.35} className="transition-opacity" onMouseEnter={() => setHover({ remote: r.key })}>
+                    <rect x={COL.remote} y={y} width={COL.remoteW} height={REMOTE_H} rx={12} className="fill-card stroke-border" strokeWidth={1} />
+                    <text x={COL.remote + 16} y={y + 22} className="fill-foreground font-mono text-[12px] font-medium">{r.host.length > 26 ? r.host.slice(0, 25) + "…" : r.host}</text>
+                    <text x={COL.remote + 16} y={y + 39} className="fill-muted-foreground font-mono text-[11px]">:{r.port} · {r.protocols.join("+")}</text>
+                    <circle cx={COL.remote} cy={y + REMOTE_H / 2} r={3.5} className="fill-card stroke-muted-foreground" strokeWidth={1.5} />
+                  </g>
+                );
+              })}
+            </svg>
+          </div>
         </Card>
       )}
 
-      {/* 汇总表 */}
-      <Card className="overflow-hidden pb-0">
-        <div className="p-4 pb-2 text-sm font-semibold">链路明细</div>
-        <table className="w-full text-sm">
-          <thead><tr className="border-b text-left text-xs text-muted-foreground">
-            <th className="px-4 py-2.5 font-medium">转发</th><th className="px-4 py-2.5 font-medium">节点</th>
-            <th className="px-4 py-2.5 font-medium">链路</th><th className="px-4 py-2.5 font-medium">探测</th><th className="px-4 py-2.5 font-medium">状态</th>
-          </tr></thead>
-          <tbody>
-            {rules.map((r) => (
-              <tr key={r.tag} className="border-b last:border-0 hover:bg-muted/40">
-                <td className="px-4 py-2.5 font-medium">{r.tag}</td>
-                <td className="px-4 py-2.5">{r.node_id === 0 ? <Badge variant="secondary">本机</Badge> : <Badge variant="info">{r.node_name}</Badge>}</td>
-                <td className="px-4 py-2.5 font-mono text-xs">:{r.listen_port} → {r.remote_host}:{r.remote_tcp_port}</td>
-                <td className="px-4 py-2.5 font-mono text-xs">
-                  {r.probe ? (r.probe.ok ? <span className="text-emerald-400">{r.probe.ms}ms</span> : <span className={r.probe.soft ? "text-amber-400" : "text-red-400"}>失败</span>) : <span className="text-muted-foreground">-</span>}
-                </td>
-                <td className="px-4 py-2.5">{(r.desired_state || "running") === "running" ? <Badge variant="success">运行</Badge> : <Badge variant="secondary">停止</Badge>}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </Card>
+      {rules.length > 0 && (
+        <Card className="mt-4 overflow-hidden">
+          <CardHeader><CardTitle>链路明细</CardTitle><CardDescription>每条转发的入口、落地与探测结果</CardDescription></CardHeader>
+          <Table>
+            <TableHeader><TableRow className="hover:bg-transparent">
+              <TableHead>转发</TableHead><TableHead>中转</TableHead><TableHead>链路</TableHead><TableHead>探测</TableHead><TableHead>状态</TableHead>
+            </TableRow></TableHeader>
+            <TableBody>
+              {rules.map((r) => {
+                const pv = probeView(r);
+                const st = ruleState(r);
+                return (
+                  <TableRow key={r.tag} onMouseEnter={() => setHover({ tag: r.tag })} onMouseLeave={() => setHover(null)} className={cn(hover?.tag === r.tag && "bg-muted/50")}>
+                    <TableCell className="font-medium">{r.tag}</TableCell>
+                    <TableCell className="text-[13px]">{r.node_id === 0 ? <Badge variant="default">本机</Badge> : r.node_name}</TableCell>
+                    <TableCell className="font-mono text-xs">
+                      {ruleDestinations(r).map((d) => (
+                        <div key={d.key}><span className="text-muted-foreground">{d.protocols.join("+")}</span> :{r.listen_port} → {d.host}:{d.port}</div>
+                      ))}
+                    </TableCell>
+                    <TableCell>{pv ? <span className={cn("font-mono text-xs", toneText[pv.tone])}>{pv.label}</span> : <span className="text-xs text-muted-foreground">—</span>}</TableCell>
+                    <TableCell><StatusLabel tone={st.tone} live={st.live}>{st.label}</StatusLabel></TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </Card>
+      )}
     </div>
   );
 }

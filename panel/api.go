@@ -5,26 +5,26 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
 )
 
-const panelVersion = "relay-panel v1.0.0 (tcp_pool v1.7)"
+const panelVersion = "relay-panel v1.1.0 (tcp_pool v1.8)"
 
 type API struct {
-	store    *Store
-	sd       *SystemdManager
-	tuner    *Tuner
-	run      *Runner
-	sessions *SessionCache
-	tls      *TLSConfig
-	traffic  *TrafficCollector
-	prober   *Prober
+	store   *Store
+	sd      *SystemdManager
+	tuner   *Tuner
+	run     *Runner
+	tls     *TLSConfig
+	traffic *TrafficCollector
+	prober  *Prober
 }
 
 func (a *API) tlsFingerprint() string {
@@ -32,45 +32,6 @@ func (a *API) tlsFingerprint() string {
 		return ""
 	}
 	return a.tls.Fingerprint
-}
-
-// SessionCache 进程内缓存 session -> user，避免每个请求都读磁盘。
-type SessionCache struct {
-	mu    sync.Mutex
-	cache map[string]*User
-}
-
-func NewSessionCache() *SessionCache {
-	return &SessionCache{cache: map[string]*User{}}
-}
-
-func (sc *SessionCache) Get(store *Store, token string) *User {
-	sc.mu.Lock()
-	u, ok := sc.cache[token]
-	sc.mu.Unlock()
-	if ok {
-		// 缓存命中也回源校验一次（处理被禁用/删除/登出）
-		if fresh := store.Auth(token); fresh != nil {
-			return fresh
-		}
-		sc.mu.Lock()
-		delete(sc.cache, token)
-		sc.mu.Unlock()
-		return nil
-	}
-	u = store.Auth(token)
-	if u != nil {
-		sc.mu.Lock()
-		sc.cache[token] = u
-		sc.mu.Unlock()
-	}
-	return u
-}
-
-func (sc *SessionCache) Drop(token string) {
-	sc.mu.Lock()
-	delete(sc.cache, token)
-	sc.mu.Unlock()
 }
 
 // ---------- helpers ----------
@@ -90,7 +51,7 @@ func (a *API) currentUser(r *http.Request) *User {
 	if err != nil || c.Value == "" {
 		return nil
 	}
-	return a.sessions.Get(a.store, c.Value)
+	return a.store.Auth(c.Value)
 }
 
 func (a *API) requireAuth(w http.ResponseWriter, r *http.Request) (*User, string, bool) {
@@ -99,7 +60,7 @@ func (a *API) requireAuth(w http.ResponseWriter, r *http.Request) (*User, string
 		errJSON(w, http.StatusUnauthorized, "未登录")
 		return nil, "", false
 	}
-	u := a.sessions.Get(a.store, c.Value)
+	u := a.store.Auth(c.Value)
 	if u == nil {
 		errJSON(w, http.StatusUnauthorized, "会话已失效，请重新登录")
 		return nil, "", false
@@ -142,19 +103,19 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 400, "请求格式错误")
 		return
 	}
-	token, u, err := a.store.Login(req.Username, req.Password)
+	token, u, err := a.store.Login(req.Username, req.Password, loginClientIP(r))
 	if err != nil {
-		if errors.Is(err, ErrBadAuth) {
+		switch {
+		case errors.Is(err, ErrBadAuth):
 			errJSON(w, 401, "用户名或密码错误")
-		} else {
-			//锁定/禁用等带具体原因的错误直接透传
+		case errors.Is(err, ErrLoginLocked):
+			errJSON(w, http.StatusTooManyRequests, err.Error())
+		default:
+			//禁用等带具体原因的错误直接透传（仅在密码正确时出现）
 			errJSON(w, 401, err.Error())
 		}
 		return
 	}
-	a.sessions.mu.Lock()
-	a.sessions.cache[token] = u
-	a.sessions.mu.Unlock()
 	//反代/CDN 场景：直连 TLS 或 X-Forwarded-Proto=https 时标记 Secure
 	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 	http.SetCookie(w, &http.Cookie{
@@ -169,6 +130,30 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"user": publicUser(u)})
 }
 
+// loginClientIP 返回登录限流使用的客户端地址。直连对端是本机或内网地址时
+// （面板前面有 nginx / Caddy 等反向代理的常见部署），采用代理追加在
+// X-Forwarded-For 最右侧的地址；公网直连时忽略这些头，防止伪造绕过限流。
+func loginClientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+	if peer == nil || !(peer.IsLoopback() || peer.IsPrivate()) {
+		return host
+	}
+	if values := r.Header.Values("X-Forwarded-For"); len(values) > 0 {
+		parts := strings.Split(values[len(values)-1], ",")
+		if ip := net.ParseIP(strings.TrimSpace(parts[len(parts)-1])); ip != nil {
+			return ip.String()
+		}
+	}
+	if ip := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); ip != nil {
+		return ip.String()
+	}
+	return host
+}
+
 func publicUser(u *User) map[string]any {
 	return map[string]any{
 		"id": u.ID, "username": u.Username, "is_admin": u.IsAdmin,
@@ -179,7 +164,6 @@ func publicUser(u *User) map[string]any {
 func (a *API) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie("panel_session"); err == nil && c.Value != "" {
 		a.store.Logout(c.Value)
-		a.sessions.Drop(c.Value)
 	}
 	writeJSON(w, 200, map[string]string{"ok": "1"})
 }
@@ -210,67 +194,67 @@ type ruleDTO struct {
 	TrafficQuotaBytes int64          `json:"traffic_quota_bytes"` //流量配额字节，0不限
 }
 
+// validateRule 校验失败时直接写出错误响应并返回 nil。
 func (a *API) validateRule(w http.ResponseWriter, req *ruleDTO, existingTag string) *Rule {
+	rule, code, msg := a.checkRule(req, existingTag)
+	if rule == nil {
+		errJSON(w, code, msg)
+	}
+	return rule
+}
+
+// checkRule 校验并规范化规则；失败时返回 HTTP 状态码与可直接展示的错误信息。
+func (a *API) checkRule(req *ruleDTO, existingTag string) (*Rule, int, string) {
 	if !tagRe.MatchString(req.Tag) {
-		errJSON(w, 400, "标签只能包含字母数字下划线横杠，长度 1-32")
-		return nil
+		return nil, 400, "标签只能包含字母数字下划线横杠，长度 1-32"
 	}
 	if req.ListenIP == "" {
 		req.ListenIP = "0.0.0.0"
 	}
 	if !validLocalIP(req.ListenIP) {
-		errJSON(w, 400, "监听 IP 不合法（支持 IPv4/IPv6 地址）")
-		return nil
+		return nil, 400, "监听 IP 不合法（支持 IPv4/IPv6 地址）"
 	}
 	if !validPort(req.ListenPort) {
-		errJSON(w, 400, "监听端口需在 1-65535")
-		return nil
+		return nil, 400, "监听端口需在 1-65535"
 	}
-	if !remoteHostRe.MatchString(req.RemoteHost) {
-		errJSON(w, 400, "远端地址不合法（支持 IP 或域名）")
-		return nil
+	if net.ParseIP(req.RemoteHost) == nil && !remoteHostRe.MatchString(req.RemoteHost) {
+		return nil, 400, "远端地址不合法（支持 IP 或域名）"
 	}
 	if !req.EnableTCP && !req.EnableUDP {
-		errJSON(w, 400, "TCP 和 UDP 至少启用一个")
-		return nil
+		return nil, 400, "TCP 和 UDP 至少启用一个"
 	}
 	if req.EnableTCP && !validPort(req.RemoteTCPPort) {
-		errJSON(w, 400, "远端 TCP 端口需在 1-65535")
-		return nil
+		return nil, 400, "远端 TCP 端口需在 1-65535"
 	}
 	if req.RemoteUDPPort == 0 && req.EnableTCP {
 		req.RemoteUDPPort = req.RemoteTCPPort
 	}
 	if req.EnableUDP && !validPort(req.RemoteUDPPort) {
-		errJSON(w, 400, "远端 UDP 端口需在 1-65535")
-		return nil
+		return nil, 400, "远端 UDP 端口需在 1-65535"
 	}
-	if req.NodeID != 0 && a.store.GetNode(req.NodeID) == nil {
-		errJSON(w, 400, "所选节点不存在")
-		return nil
+	if req.NodeID != 0 {
+		n := a.store.GetNode(req.NodeID)
+		if n == nil || n.Deleting {
+			return nil, 400, "所选节点不存在或正在清理"
+		}
 	}
-	if a.store.PortInUse(req.NodeID, req.ListenIP, req.ListenPort, existingTag) {
-		errJSON(w, 409, fmt.Sprintf("该节点上监听 %s:%d 已被其他规则占用", req.ListenIP, req.ListenPort))
-		return nil
+	if a.store.PortInUse(&Rule{NodeID: req.NodeID, ListenIP: req.ListenIP, ListenPort: req.ListenPort, EnableTCP: req.EnableTCP, EnableUDP: req.EnableUDP}, existingTag) {
+		return nil, 409, fmt.Sprintf("该节点上监听 %s:%d 已被其他规则占用", req.ListenIP, req.ListenPort)
 	}
 	for k, v := range req.Advanced {
 		spec, ok := advancedSpec[k]
 		if !ok {
-			errJSON(w, 400, "未知高级参数: "+k)
-			return nil
+			return nil, 400, "未知高级参数: " + k
 		}
 		if v < spec[0] || v > spec[1] {
-			errJSON(w, 400, fmt.Sprintf("%s 取值范围 %d-%d", k, spec[0], spec[1]))
-			return nil
+			return nil, 400, fmt.Sprintf("%s 取值范围 %d-%d", k, spec[0], spec[1])
 		}
 	}
 	if req.RateLimitKBps < 0 || req.RateLimitKBps > 10000000 {
-		errJSON(w, 400, "限速取值范围 0-10000000 KB/s")
-		return nil
+		return nil, 400, "限速取值范围 0-10000000 KB/s"
 	}
 	if req.TrafficQuotaBytes < 0 {
-		errJSON(w, 400, "流量配额不能为负数")
-		return nil
+		return nil, 400, "流量配额不能为负数"
 	}
 	return &Rule{
 		Tag: req.Tag, ListenIP: req.ListenIP, ListenPort: req.ListenPort,
@@ -280,7 +264,7 @@ func (a *API) validateRule(w http.ResponseWriter, req *ruleDTO, existingTag stri
 		NodeID:            req.NodeID,
 		RateLimitKBps:     req.RateLimitKBps,
 		TrafficQuotaBytes: req.TrafficQuotaBytes,
-	}
+	}, 200, ""
 }
 
 func (a *API) handleRulesList(w http.ResponseWriter, r *http.Request) {
@@ -389,11 +373,11 @@ func (a *API) handleRuleCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rule.OwnerID = u.ID
-	if err := a.store.UpsertRule(rule); err != nil {
+	if err := a.store.CreateRule(rule); err != nil {
 		errJSON(w, 500, "保存失败: "+err.Error())
 		return
 	}
-	if err := a.applyRule(rule, 0); err != nil {
+	if err := a.applyRule(rule, rule.NodeID); err != nil {
 		errJSON(w, 500, "规则已保存但启动失败: "+err.Error())
 		return
 	}
@@ -430,7 +414,17 @@ func (a *API) handleRuleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	rule.OwnerID = old.OwnerID
 	rule.DesiredState = old.DesiredState
+	// Stop the old local instance before publishing the remote assignment.
+	if old.NodeID == 0 && rule.NodeID != 0 {
+		if err := a.sd.DeleteUnit(rule.Tag); err != nil {
+			errJSON(w, 500, "停止旧本机实例失败: "+err.Error())
+			return
+		}
+	}
 	if err := a.store.UpsertRule(rule); err != nil {
+		if old.NodeID == 0 && rule.NodeID != 0 {
+			a.restoreLocalRule(old)
+		}
 		errJSON(w, 500, "保存失败: "+err.Error())
 		return
 	}
@@ -449,8 +443,9 @@ func (a *API) applyRule(rule *Rule, oldNodeID int64) error {
 	rules := a.store.ListRules(0, true)
 	if rule.NodeID != 0 {
 		if oldNodeID == 0 {
-			_ = a.sd.DeleteUnit(rule.Tag)
-			_ = a.sd.RemoveRuleFiles(rules, rule.Tag)
+			if err := a.sd.RemoveRuleFiles(rules, rule.Tag); err != nil {
+				return err
+			}
 			a.sd.DaemonReload()
 		}
 		return nil
@@ -458,11 +453,47 @@ func (a *API) applyRule(rule *Rule, oldNodeID int64) error {
 	if err := a.sd.WriteRuleFiles(rules, rule); err != nil {
 		return err
 	}
-	if oldNodeID != 0 {
-		// 远端迁回本机：正常重启即可
-		return a.sd.RestartRule(rule.Tag)
+	if rule.TrafficQuotaBytes > 0 {
+		if stats := ReadRuleStats(rule.Tag); stats != nil && stats.Total() >= uint64(rule.TrafficQuotaBytes) {
+			a.store.SetRuleOverQuota(rule.Tag, true)
+			rule.OverQuota = true
+		}
+	}
+	if rule.DesiredState == "stopped" || rule.OverQuota {
+		return a.sd.StopRule(rule.Tag)
 	}
 	return a.sd.RestartRule(rule.Tag)
+}
+
+// deleteRule 删除一条规则：本机规则先停实例再删记录，删记录失败时按原期望状态
+// 恢复实例，避免出现「规则还在、实例已停」。deleted 表示记录是否已删除，此时 err
+// 只代表配置文件清理失败。daemon-reload 由调用方统一执行。
+func (a *API) deleteRule(old *Rule) (deleted bool, err error) {
+	if old.NodeID == 0 {
+		if err := a.sd.DeleteUnit(old.Tag); err != nil {
+			return false, fmt.Errorf("停止实例失败: %w", err)
+		}
+	}
+	if _, err := a.store.DeleteRule(old.Tag); err != nil {
+		if old.NodeID == 0 {
+			a.restoreLocalRule(old)
+		}
+		return false, fmt.Errorf("删除失败: %w", err)
+	}
+	if old.NodeID == 0 {
+		// 本机规则立即清理；远端规则由被控节点下次轮询发现后自行清理
+		if err := a.sd.RemoveRuleFiles(a.store.ListRules(0, true), old.Tag); err != nil {
+			return true, fmt.Errorf("规则已删除但配置文件清理失败: %w", err)
+		}
+	}
+	return true, nil
+}
+
+// restoreLocalRule 在存储写入失败后按原配置恢复已被停掉的本机实例。
+func (a *API) restoreLocalRule(old *Rule) {
+	if err := a.applyRule(old, 0); err != nil {
+		log.Printf("恢复本机实例 %s 失败: %v", old.Tag, err)
+	}
 }
 
 func (a *API) handleRuleDelete(w http.ResponseWriter, r *http.Request) {
@@ -480,18 +511,11 @@ func (a *API) handleRuleDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 403, "只能删除自己的转发")
 		return
 	}
-	if _, err := a.store.DeleteRule(tag); err != nil {
-		errJSON(w, 500, "删除失败: "+err.Error())
+	if _, err := a.deleteRule(old); err != nil {
+		errJSON(w, 500, err.Error())
 		return
 	}
 	if old.NodeID == 0 {
-		// 本机规则立即清理；远端规则由被控节点下次轮询发现后自行清理
-		_ = a.sd.DeleteUnit(tag)
-		rules := a.store.ListRules(0, true)
-		if err := a.sd.RemoveRuleFiles(rules, tag); err != nil {
-			errJSON(w, 500, "规则已删除但配置文件清理失败: "+err.Error())
-			return
-		}
 		a.sd.DaemonReload()
 	}
 	writeJSON(w, 200, map[string]string{"ok": "1"})
@@ -524,7 +548,7 @@ func (a *API) handleRuleAction(w http.ResponseWriter, r *http.Request) {
 		// 本机规则：直接操作 systemd
 		var err error
 		if desired == "running" {
-			err = a.sd.RestartRule(tag)
+			err = a.sd.RestartRuleFresh(tag)
 		} else {
 			err = a.sd.StopRule(tag)
 		}
@@ -668,12 +692,7 @@ func (a *API) handleUserDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 400, "不能删除自己")
 		return
 	}
-	// 该用户的规则移交给操作者，避免变成孤儿实例
-	for _, rl := range a.store.ListRules(id, true) {
-		rl.OwnerID = me.ID
-		_ = a.store.UpsertRule(rl)
-	}
-	if err := a.store.DeleteUser(id); err == ErrNotFound {
+	if err := a.store.DeleteUserAndTransfer(id, me.ID); err == ErrNotFound {
 		errJSON(w, 404, "用户不存在")
 		return
 	} else if err != nil {
@@ -711,7 +730,7 @@ func (a *API) handlePassword(w http.ResponseWriter, r *http.Request) {
 // ---------- system ----------
 
 func (a *API) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
-	_, _, ok := a.requireAuth(w, r)
+	_, _, ok := a.requireAdmin(w, r)
 	if !ok {
 		return
 	}

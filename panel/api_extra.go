@@ -56,13 +56,14 @@ func (a *API) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"rules_stopped": stopped,
 		"nodes_total":   nodesTotal,
 		"nodes_online":  nodesOnline,
-		"users_total":   len(a.store.ListUsers()),
 		"traffic_total": trafficTotal,
 		"over_quota":    overQuota,
-		"machine":       ReadMachineInfo(),
 		"version":       panelVersion,
 	}
+	// 主控主机信息、调优状态与用户总数只对管理员展示
 	if u.IsAdmin {
+		resp["users_total"] = len(a.store.ListUsers())
+		resp["machine"] = ReadMachineInfo()
 		resp["tuning"] = a.tuner.Status()
 	}
 	writeJSON(w, 200, resp)
@@ -88,15 +89,19 @@ func (a *API) handleRulesBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// done 只统计真正生效的规则；失败原因记录第一条返回给前端，避免静默跳过
 	done, skipped := 0, 0
+	var firstErr string
+	fail := func(tag string, err error) {
+		skipped++
+		if firstErr == "" {
+			firstErr = tag + "：" + err.Error()
+		}
+	}
 	for _, tag := range req.Tags {
 		rl := a.store.GetRule(tag)
-		if rl == nil {
-			skipped++
-			continue
-		}
-		if !u.IsAdmin && rl.OwnerID != u.ID {
-			skipped++
+		if rl == nil || (!u.IsAdmin && rl.OwnerID != u.ID) {
+			skipped++ // 不存在或无权操作：不暴露原因
 			continue
 		}
 		switch req.Action {
@@ -108,35 +113,35 @@ func (a *API) handleRulesBatch(w http.ResponseWriter, r *http.Request) {
 			if rl.NodeID == 0 {
 				var err error
 				if desired == "running" {
-					err = a.sd.RestartRule(tag)
+					err = a.sd.RestartRuleFresh(tag)
 				} else {
 					err = a.sd.StopRule(tag)
 				}
 				if err != nil {
-					skipped++
+					fail(tag, err)
 					continue
 				}
 			}
-			_ = a.store.SetRuleDesiredState(tag, desired)
-			if desired == "running" {
-				a.store.SetRuleOverQuota(tag, false)
-			}
-		case "delete":
-			if _, err := a.store.DeleteRule(tag); err != nil {
-				skipped++
+			if err := a.store.SetRuleDesiredState(tag, desired); err != nil {
+				fail(tag, err)
 				continue
 			}
-			if rl.NodeID == 0 {
-				_ = a.sd.DeleteUnit(tag)
+		case "delete":
+			deleted, err := a.deleteRule(rl)
+			if err != nil && !deleted {
+				fail(tag, err)
+				continue
+			}
+			if err != nil && firstErr == "" {
+				firstErr = tag + "：" + err.Error() // 已删除，仅配置文件清理失败
 			}
 		}
 		done++
 	}
 	if req.Action == "delete" {
-		_ = a.sd.RemoveRuleFiles(a.store.ListRules(0, true), "")
 		a.sd.DaemonReload()
 	}
-	writeJSON(w, 200, map[string]any{"done": done, "skipped": skipped})
+	writeJSON(w, 200, map[string]any{"done": done, "skipped": skipped, "error": firstErr})
 }
 
 // ---------- 导入 / 导出 ----------
@@ -166,7 +171,7 @@ func (a *API) handleRulesImport(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Rules  []ruleDTO `json:"rules"`
-		NodeID int64     `json:"node_id"` //批量添加/导入的目标节点（0=本机）
+		NodeID *int64    `json:"node_id"` //仅显式指定时覆盖每条规则的节点
 	}
 	if err := readBody(r, &req); err != nil {
 		errJSON(w, 400, "请求格式错误")
@@ -181,23 +186,37 @@ func (a *API) handleRulesImport(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		//导入的规则归属当前管理员；目标节点可选
-		dto.NodeID = req.NodeID
-		w2 := &dummyWriter{code: 200}
-		rl := a.validateRule(w2, &dto, "")
-		if w2.code != 200 || rl == nil {
+		if req.NodeID != nil {
+			dto.NodeID = *req.NodeID
+		}
+		rl, _, msg := a.checkRule(&dto, "")
+		if rl == nil {
 			failed++
 			if firstErr == "" {
-				firstErr = w2.msg
+				firstErr = msg
+				if dto.Tag != "" {
+					firstErr = dto.Tag + "：" + msg
+				}
 			}
 			continue
 		}
 		rl.OwnerID = u.ID
-		if err := a.store.UpsertRule(rl); err != nil {
+		if err := a.store.CreateRule(rl); err != nil {
+			if err == ErrDuplicate {
+				skipped++
+				continue
+			}
 			failed++
+			if firstErr == "" {
+				firstErr = err.Error()
+			}
 			continue
 		}
-		if err := a.applyRule(rl, 0); err != nil {
+		if err := a.applyRule(rl, rl.NodeID); err != nil {
 			failed++
+			if firstErr == "" {
+				firstErr = err.Error()
+			}
 			continue
 		}
 		imported++
@@ -206,21 +225,6 @@ func (a *API) handleRulesImport(w http.ResponseWriter, r *http.Request) {
 		"imported": imported, "skipped": skipped, "failed": failed, "error": firstErr,
 	})
 }
-
-// dummyWriter 让 validateRule 复用错误输出而不真正写响应
-type dummyWriter struct {
-	code int
-	msg  string
-}
-
-func (d *dummyWriter) Header() http.Header { return http.Header{} }
-func (d *dummyWriter) Write(b []byte) (int, error) {
-	if d.msg == "" {
-		d.msg = string(b)
-	}
-	return len(b), nil
-}
-func (d *dummyWriter) WriteHeader(code int) { d.code = code }
 
 // ---------- TLS 信息（节点安装命令引用指纹） ----------
 
@@ -232,6 +236,9 @@ func (a *API) handleTLSInfo(w http.ResponseWriter, r *http.Request) {
 		"enabled":     a.tls != nil && a.tls.Enabled,
 		"fingerprint": a.tlsFingerprint(),
 		"generated":   a.tls != nil && a.tls.Generated,
+		"pin_recommended": a.tls != nil && a.tls.Generated && r.TLS != nil &&
+			r.Header.Get("Forwarded") == "" && r.Header.Get("X-Forwarded-Proto") == "" &&
+			r.Header.Get("X-Forwarded-Host") == "" && r.Header.Get("Cf-Ray") == "",
 	})
 }
 

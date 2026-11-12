@@ -61,19 +61,39 @@ func ruleProbeTarget(r *Rule) (host string, port int, soft bool, ok bool) {
 }
 
 func (p *Prober) Cycle() {
-	for _, r := range p.store.ListRules(0, true) {
-		host, port, soft, ok := ruleProbeTarget(r)
-		if !ok {
-			continue
-		}
-		res := probeOne(host, port, soft)
-		p.mu.Lock()
-		p.results[r.Tag] = res
-		p.mu.Unlock()
+	rules := p.store.ListRules(0, true)
+	jobs := make(chan *Rule)
+	results := map[string]*ProbeResult{}
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for r := range jobs {
+				host, port, soft, ok := ruleProbeTarget(r)
+				if !ok {
+					continue
+				}
+				res := probeOne(host, port, soft)
+				mu.Lock()
+				results[r.Tag] = res
+				mu.Unlock()
+			}
+		}()
 	}
+	for _, r := range rules {
+		jobs <- r
+	}
+	close(jobs)
+	wg.Wait()
+	p.mu.Lock()
+	p.results = results
+	p.mu.Unlock()
 }
 
 func (p *Prober) Run(interval time.Duration) {
+	p.Cycle()
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for range t.C {

@@ -17,7 +17,10 @@ type Node struct {
 	CreatedAt  time.Time `json:"created_at"`
 	LastSeen   time.Time `json:"last_seen"`   // 最近一次心跳
 	ReportJSON string    `json:"report_json"` // 最近一次上报原文
+	Deleting   bool      `json:"deleting"`    //保留密钥直到节点确认已清理实例
 }
+
+func cloneNode(n *Node) *Node { cp := *n; return &cp }
 
 // NodeReport 被控节点上报的内容，主控据此展示节点与远端规则状态。
 type NodeReport struct {
@@ -57,14 +60,16 @@ func (s *Store) CreateNode(name string) (*Node, error) {
 	}
 	s.st.NextNodeID++
 	s.st.Nodes = append(s.st.Nodes, n)
-	return n, s.saveLocked()
+	return cloneNode(n), s.saveLocked()
 }
 
 func (s *Store) ListNodes() []*Node {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*Node, len(s.st.Nodes))
-	copy(out, s.st.Nodes)
+	for i, n := range s.st.Nodes {
+		out[i] = cloneNode(n)
+	}
 	return out
 }
 
@@ -73,7 +78,7 @@ func (s *Store) GetNode(id int64) *Node {
 	defer s.mu.Unlock()
 	for _, n := range s.st.Nodes {
 		if n.ID == id {
-			return n
+			return cloneNode(n)
 		}
 	}
 	return nil
@@ -84,7 +89,7 @@ func (s *Store) GetNodeByKey(key string) *Node {
 	defer s.mu.Unlock()
 	for _, n := range s.st.Nodes {
 		if n.Key == key {
-			return n
+			return cloneNode(n)
 		}
 	}
 	return nil
@@ -100,25 +105,70 @@ func (s *Store) RegenerateNodeKey(id int64) (*Node, error) {
 	}
 	for _, n := range s.st.Nodes {
 		if n.ID == id {
+			if n.Deleting {
+				return nil, fmt.Errorf("节点正在清理，不能重置密钥")
+			}
 			n.Key = hex.EncodeToString(buf)
-			return n, s.saveLocked()
+			return cloneNode(n), s.saveLocked()
 		}
 	}
 	return nil, ErrNotFound
 }
 
-// DeleteNode 删除节点；其名下规则由调用方先处理（级联删除）。
-func (s *Store) DeleteNode(id int64) error {
+// BeginDeleteNode retains authentication until cleanup is acknowledged.
+func (s *Store) BeginDeleteNode(id int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	nodes := s.st.Nodes[:0]
+	var node *Node
 	for _, n := range s.st.Nodes {
-		if n.ID != id {
+		if n.ID == id {
+			node = n
+			break
+		}
+	}
+	if node == nil {
+		return 0, ErrNotFound
+	}
+	oldRules, oldDeleting := s.st.Rules, node.Deleting
+	kept := make([]*Rule, 0, len(oldRules))
+	for _, r := range oldRules {
+		if r.NodeID != id {
+			kept = append(kept, r)
+		}
+	}
+	s.st.Rules, node.Deleting = kept, true
+	if err := s.saveLocked(); err != nil {
+		s.st.Rules, node.Deleting = oldRules, oldDeleting
+		return 0, err
+	}
+	return len(oldRules) - len(kept), nil
+}
+
+func (s *Store) CompleteNodeDeletion(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old := s.st.Nodes
+	nodes := make([]*Node, 0, len(old))
+	found := false
+	for _, n := range s.st.Nodes {
+		if n.ID == id {
+			if !n.Deleting {
+				return fmt.Errorf("节点未请求删除")
+			}
+			found = true
+		} else {
 			nodes = append(nodes, n)
 		}
 	}
+	if !found {
+		return ErrNotFound
+	}
 	s.st.Nodes = nodes
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		s.st.Nodes = old
+		return err
+	}
+	return nil
 }
 
 // TouchNode 更新心跳与上报原文；超过 30s 才落盘一次，避免高频写 JSON。

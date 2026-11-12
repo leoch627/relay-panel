@@ -18,7 +18,8 @@ type RuleStats struct {
 	RateKBps   int64  `json:"rate_kbps"`
 	T          int64  `json:"t"` //快照unix秒
 	//以下由面板计算填充，不来自文件
-	OverQuota bool `json:"over_quota,omitempty"`
+	OverQuota  bool  `json:"over_quota,omitempty"`
+	QuotaReset int64 `json:"quota_reset,omitempty"`
 }
 
 // statsDir 可用 PANEL_STATS_DIR 覆盖（默认与 C 程序约定路径一致）
@@ -61,12 +62,12 @@ func EnforceLocalQuotas(store *Store, sd *SystemdManager) {
 			continue
 		}
 		st := ReadRuleStats(r.Tag)
-		if st == nil {
-			continue
-		}
-		if st.Total() >= uint64(r.TrafficQuotaBytes) {
-			_ = sd.StopRule(r.Tag)
-			store.SetRuleOverQuota(r.Tag, true)
+		// /run statistics disappear at reboot; the persisted stop must remain
+		// effective until the user explicitly resets or changes the quota.
+		if r.OverQuota || (st != nil && st.Total() >= uint64(r.TrafficQuotaBytes)) {
+			if err := sd.StopRule(r.Tag); err == nil {
+				store.SetRuleOverQuota(r.Tag, true)
+			}
 		}
 	}
 }

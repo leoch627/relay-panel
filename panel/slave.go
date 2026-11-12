@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -9,7 +10,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,21 +23,36 @@ import (
 // 有 systemd 时用 systemd 单元；没有（Alpine/OpenRC 等）时直跑子进程。
 // 全程出站连接，被控机可在 NAT 后面，无需开放任何入站端口。
 type Slave struct {
-	masterURL     string
-	nodeKey       string
-	run           *Runner
-	mgr           RuleRunner      // systemd 或直跑
-	proc          *ProcessManager // 直跑模式非 nil
-	direct        bool
-	confDir       string
-	statePath     string
-	binPath       string
-	client        *http.Client
-	overQuotaSent map[string]bool //本周期已因超限停机的规则，避免重复stop
+	masterURL      string
+	nodeKey        string
+	run            *Runner
+	mgr            RuleRunner      // systemd 或直跑
+	proc           *ProcessManager // 直跑模式非 nil
+	direct         bool
+	confDir        string
+	statePath      string
+	binPath        string
+	client         *http.Client
+	tlsFingerprint string
+	tlsInsecure    bool
+	probeMu        sync.Mutex
+	probeResults   map[string]*ProbeResult
+	probeLast      time.Time
+	probeRunning   bool
+	probe          func(string, int, bool) *ProbeResult
 }
 
 type slaveState struct {
-	Applied map[string]int64 `json:"applied"` // tag -> 已应用版本（revision）
+	Applied     map[string]int64     `json:"applied"` // tag -> 已应用版本（revision）
+	QuotaStops  map[string]quotaStop `json:"quota_stops,omitempty"`
+	QuotaResets map[string]int64     `json:"quota_resets,omitempty"`
+	Rules       []nodeRulePayload    `json:"rules,omitempty"` // last pull, also used for offline quota checks
+	KernelHash  string               `json:"kernel_hash,omitempty"`
+}
+
+type quotaStop struct {
+	Bytes uint64 `json:"bytes"`
+	Reset int64  `json:"reset"`
 }
 
 func NewSlave(masterURL, nodeKey string, run *Runner, p Paths, tlsCfg *tls.Config, direct bool) *Slave {
@@ -40,14 +61,16 @@ func NewSlave(masterURL, nodeKey string, run *Runner, p Paths, tlsCfg *tls.Confi
 		transport.TLSClientConfig = tlsCfg
 	}
 	s := &Slave{
-		masterURL: masterURL,
-		nodeKey:   nodeKey,
-		run:       run,
-		direct:    direct,
-		confDir:   p.ConfDir,
-		statePath: "/etc/relay-panel/slave-state.json",
-		binPath:   p.TCPPoolBin,
-		client:    &http.Client{Timeout: 15 * time.Second, Transport: transport},
+		masterURL:    masterURL,
+		nodeKey:      nodeKey,
+		run:          run,
+		direct:       direct,
+		confDir:      p.ConfDir,
+		statePath:    "/etc/relay-panel/slave-state.json",
+		binPath:      p.TCPPoolBin,
+		client:       &http.Client{Timeout: 15 * time.Second, Transport: transport},
+		probeResults: map[string]*ProbeResult{},
+		probe:        probeOne,
 	}
 	if direct {
 		s.proc = NewProcessManager(run, p)
@@ -66,7 +89,7 @@ func (s *Slave) EnsureEmbeddedTCPPool() error {
 	}
 	needWrite := true
 	if out, _, err := s.run.Run(s.binPath, "--version"); err == nil {
-		if strings.Contains(out, "enable_tcp") {
+		if strings.Contains(out, "udp_rate_limit") {
 			needWrite = false //已有可用版本
 		}
 	}
@@ -77,7 +100,7 @@ func (s *Slave) EnsureEmbeddedTCPPool() error {
 	if err := writeFileAtomic(s.binPath, embeddedTCPPool, 0o755); err != nil {
 		return fmt.Errorf("写入 %s 失败: %w", s.binPath, err)
 	}
-	if out, _, err := s.run.Run(s.binPath, "--version"); err != nil || !strings.Contains(out, "enable_tcp") {
+	if out, _, err := s.run.Run(s.binPath, "--version"); err != nil || !strings.Contains(out, "udp_rate_limit") {
 		return fmt.Errorf("内嵌 tcp_pool 无法在本机运行（%v）", err)
 	}
 	return nil
@@ -88,6 +111,7 @@ type pullResponse struct {
 	Interval int               `json:"interval"`
 	Rules    []nodeRulePayload `json:"rules"`
 	Error    string            `json:"error"`
+	Deleting bool              `json:"deleting"`
 }
 
 func (s *Slave) request(method, path string, body any, out any) error {
@@ -137,7 +161,45 @@ func (s *Slave) loadState() slaveState {
 	if st.Applied == nil {
 		st.Applied = map[string]int64{}
 	}
+	if st.QuotaStops == nil {
+		st.QuotaStops = map[string]quotaStop{}
+	}
+	if st.QuotaResets == nil {
+		st.QuotaResets = map[string]int64{}
+	}
+	// 旧版本可能把未经校验的标签写进了状态文件，加载时一并丢弃
+	for tag := range st.Applied {
+		if !tagRe.MatchString(tag) {
+			delete(st.Applied, tag)
+		}
+	}
+	for tag := range st.QuotaStops {
+		if !tagRe.MatchString(tag) {
+			delete(st.QuotaStops, tag)
+		}
+	}
+	for tag := range st.QuotaResets {
+		if !tagRe.MatchString(tag) {
+			delete(st.QuotaResets, tag)
+		}
+	}
+	st.Rules = validPulledRules(st.Rules)
 	return st
+}
+
+// validPulledRules 丢弃标签不合法的下发规则。标签会拼进配置、统计文件路径和
+// systemd 实例名，而被控端以 root 运行；主控虽已校验，这里再校验一次，防止主控
+// 被攻破或被冒充（例如 -tls-insecure）时借 "../" 写到任意路径。
+func validPulledRules(rules []nodeRulePayload) []nodeRulePayload {
+	out := make([]nodeRulePayload, 0, len(rules))
+	for _, r := range rules {
+		if !tagRe.MatchString(r.Tag) {
+			log.Printf("[slave] 忽略标签不合法的规则 %q", r.Tag)
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 func (s *Slave) saveState(st slaveState) {
@@ -148,55 +210,131 @@ func (s *Slave) saveState(st slaveState) {
 	_ = writeFileAtomic(s.statePath, data, 0o600)
 }
 
-// reconcile 把本地实例收敛到期望状态，返回是否有变更。
+// Replacing an executable does not replace already running systemd processes.
+// Invalidate applied revisions once per binary change, then let reconcile use
+// the latest desired state and quota stops before restarting any instance.
+func (s *Slave) refreshKernelState(st *slaveState) bool {
+	if s.run.DryRun {
+		return false
+	}
+	data, err := os.ReadFile(s.binPath)
+	if err != nil {
+		return false
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(data))
+	if hash == st.KernelHash {
+		return false
+	}
+	for tag := range st.Applied {
+		st.Applied[tag] = -1
+	}
+	st.KernelHash = hash
+	return true
+}
+
+// syncQuotaState only releases a quota stop after an explicit reset or a sufficient
+// quota increase. Configuration revisions alone must never restore a blocked rule.
+func (s *Slave) syncQuotaState(pr *pullResponse, st *slaveState) bool {
+	if st.QuotaStops == nil {
+		st.QuotaStops = map[string]quotaStop{}
+	}
+	if st.QuotaResets == nil {
+		st.QuotaResets = map[string]int64{}
+	}
+	changed := false
+	for _, r := range pr.Rules {
+		if r.QuotaReset != st.QuotaResets[r.Tag] {
+			_, applied := st.Applied[r.Tag]
+			_, configErr := os.Stat(filepath.Join(s.confDir, r.Tag+".conf"))
+			if applied || configErr == nil {
+				if err := s.mgr.StopRule(r.Tag); err != nil {
+					log.Printf("[slave] 重置实例 %s 配额前停止失败: %v", r.Tag, err)
+					continue
+				}
+			}
+			if !s.run.DryRun {
+				if err := rmFile(statsPath(r.Tag)); err != nil {
+					log.Printf("[slave] 清除实例 %s 旧统计失败: %v", r.Tag, err)
+					continue
+				}
+			}
+			delete(st.QuotaStops, r.Tag)
+			if applied {
+				st.Applied[r.Tag] = -1
+			}
+			st.QuotaResets[r.Tag] = r.QuotaReset
+			changed = true
+		}
+		if stop, ok := st.QuotaStops[r.Tag]; ok && (r.Quota <= 0 || uint64(r.Quota) > stop.Bytes) {
+			delete(st.QuotaStops, r.Tag)
+			changed = true
+		}
+	}
+	return changed
+}
+
+// reconcile keeps failed changes pending so a later pull retries them. In
+// particular, a failed deletion stays in Applied and is included in reports.
 func (s *Slave) reconcile(pr *pullResponse, st *slaveState) bool {
 	changed := false
 	desired := map[string]nodeRulePayload{}
 	for _, r := range pr.Rules {
 		desired[r.Tag] = r
 	}
-
-	// 1) 清理不再属于本节点的实例
 	for tag := range st.Applied {
 		if _, ok := desired[tag]; ok {
 			continue
 		}
 		log.Printf("[slave] 移除实例 %s", tag)
-		_ = s.mgr.DeleteUnit(tag)
-		_ = rmFile(s.confDir + "/" + tag + ".conf")
+		if err := s.mgr.DeleteUnit(tag); err != nil {
+			log.Printf("[slave] 移除实例 %s 失败: %v", tag, err)
+			continue
+		}
+		if !s.run.DryRun {
+			if err := rmFile(filepath.Join(s.confDir, tag+".conf")); err != nil {
+				log.Printf("[slave] 清理实例 %s 配置失败: %v", tag, err)
+				continue
+			}
+			if err := rmFile(statsPath(tag)); err != nil {
+				log.Printf("[slave] 清理实例 %s 统计失败: %v", tag, err)
+				continue
+			}
+		}
 		delete(st.Applied, tag)
+		delete(st.QuotaStops, tag)
+		delete(st.QuotaResets, tag)
 		changed = true
 	}
-
-	// 2) 应用新增/变更的规则
 	for tag, r := range desired {
-		if st.Applied[tag] == r.Revision {
-			if _, err := os.Stat(s.confDir + "/" + tag + ".conf"); err == nil || s.run.DryRun {
-				continue // 版本一致且配置文件在，无需动作
+		if r.QuotaReset != st.QuotaResets[tag] {
+			continue
+		}
+		if revision, ok := st.Applied[tag]; ok && revision == r.Revision {
+			if _, err := os.Stat(filepath.Join(s.confDir, tag+".conf")); err == nil || s.run.DryRun {
+				continue
 			}
 		}
 		log.Printf("[slave] 应用实例 %s (rev=%d desired=%s)", tag, r.Revision, r.Desired)
-		if s.run.DryRun {
-			log.Printf("[dry-run] write %s/%s.conf (%d bytes)", s.confDir, tag, len(r.Env))
-			if r.Desired == "stopped" {
-				_ = s.mgr.StopRule(tag)
-			} else {
-				_ = s.mgr.RestartRule(tag)
+		if !s.run.DryRun {
+			if err := writeFileAtomic(filepath.Join(s.confDir, tag+".conf"), []byte(r.Env), 0o600); err != nil {
+				log.Printf("[slave] 写入 %s.conf 失败: %v", tag, err)
+				continue
 			}
-			st.Applied[tag] = r.Revision
+		}
+		if _, exists := st.Applied[tag]; !exists {
+			st.Applied[tag] = -1
 			changed = true
-			continue
 		}
-		if err := writeFileAtomic(s.confDir+"/"+tag+".conf", []byte(r.Env), 0o600); err != nil {
-			log.Printf("[slave] 写入 %s.conf 失败: %v", tag, err)
-			continue
-		}
-		if r.Desired == "stopped" {
-			_ = s.mgr.StopRule(tag)
+		_, blocked := st.QuotaStops[tag]
+		var err error
+		if r.Desired == "stopped" || blocked {
+			err = s.mgr.StopRule(tag)
 		} else {
-			if err := s.mgr.RestartRule(tag); err != nil {
-				log.Printf("[slave] 启动 %s 失败: %v", tag, err)
-			}
+			err = s.mgr.RestartRule(tag)
+		}
+		if err != nil {
+			log.Printf("[slave] 应用实例 %s 失败: %v", tag, err)
+			continue
 		}
 		st.Applied[tag] = r.Revision
 		changed = true
@@ -204,13 +342,28 @@ func (s *Slave) reconcile(pr *pullResponse, st *slaveState) bool {
 	return changed
 }
 
-// collectStatuses 汇总期望规则的本机 systemd 状态用于上报。
-func (s *Slave) collectStatuses(pr *pullResponse) map[string]UnitStatus {
+func (s *Slave) collectStatuses(pr *pullResponse, st *slaveState) map[string]UnitStatus {
 	statuses := map[string]UnitStatus{}
+	for tag := range st.Applied {
+		statuses[tag] = s.mgr.Status(tag)
+	}
 	for _, r := range pr.Rules {
 		statuses[r.Tag] = s.mgr.Status(r.Tag)
 	}
 	return statuses
+}
+
+func (s *Slave) ensureRunning(pr *pullResponse, st *slaveState) {
+	if s.proc == nil {
+		return
+	}
+	for _, r := range pr.Rules {
+		_, blocked := st.QuotaStops[r.Tag]
+		revision, applied := st.Applied[r.Tag]
+		if r.Desired != "stopped" && !blocked && applied && revision == r.Revision && r.QuotaReset == st.QuotaResets[r.Tag] {
+			s.proc.EnsureAlive(r.Tag)
+		}
+	}
 }
 
 func (s *Slave) tcpPoolVersion() string {
@@ -225,60 +378,118 @@ func (s *Slave) tcpPoolVersion() string {
 	return v
 }
 
-// enforceQuotas 节点本地配额执行：读取本机 stats 文件，超限即停机并标记。
-func (s *Slave) enforceQuotas(pr *pullResponse) map[string]*RuleStats {
+// enforceQuotas runs before reconcile/self-healing so stale or freshly reported
+// excess usage cannot be erased by a process restart. Stops survive agent restarts.
+func (s *Slave) enforceQuotas(pr *pullResponse, state *slaveState) (map[string]*RuleStats, bool) {
 	stats := map[string]*RuleStats{}
+	changed := false
+	if state.QuotaStops == nil {
+		state.QuotaStops = map[string]quotaStop{}
+	}
 	for _, r := range pr.Rules {
 		st := ReadRuleStats(r.Tag)
-		if st == nil {
-			continue
+		stop, blocked := state.QuotaStops[r.Tag]
+		if r.Quota > 0 && st != nil && st.Total() >= uint64(r.Quota) {
+			if !blocked || st.Total() > stop.Bytes {
+				stop = quotaStop{Bytes: st.Total(), Reset: r.QuotaReset}
+				state.QuotaStops[r.Tag] = stop
+				changed = true
+			}
+			blocked = true
 		}
-		if r.Quota > 0 && st.Total() >= uint64(r.Quota) {
-			if !s.overQuotaSent[r.Tag] {
-				log.Printf("[slave] 规则 %s 已超配额（%d/%d 字节），执行停机", r.Tag, st.Total(), r.Quota)
-				_ = s.mgr.StopRule(r.Tag)
-				s.overQuotaSent[r.Tag] = true
+		if blocked {
+			if err := s.mgr.StopRule(r.Tag); err != nil {
+				log.Printf("[slave] 超额实例 %s 停止失败，将重试: %v", r.Tag, err)
+			}
+			if st == nil {
+				st = &RuleStats{Up: stop.Bytes}
 			}
 			st.OverQuota = true
-		} else if r.Quota <= 0 {
-			delete(s.overQuotaSent, r.Tag) //配额被取消后允许重新计数
 		}
-		stats[r.Tag] = st
+		if st != nil {
+			st.QuotaReset = state.QuotaResets[r.Tag]
+			stats[r.Tag] = st
+		}
 	}
-	return stats
+	return stats, changed
 }
 
-// probeRemotes 节点侧定期测活：对本节点规则 TCP 建连远端测时延。
-func (s *Slave) probeRemotes(pr *pullResponse) map[string]*ProbeResult {
-	probes := map[string]*ProbeResult{}
-	for _, r := range pr.Rules {
-		parts := strings.SplitN(r.Env, "\n", -1)
-		host, tcpPort, udpPort := "", 0, 0
-		for _, line := range parts {
-			kv := strings.SplitN(line, "=", 2)
-			if len(kv) != 2 {
-				continue
-			}
-			switch kv[0] {
-			case "REMOTE_IP":
-				host = kv[1]
-			case "REMOTE_TCP_PORT":
-				fmt.Sscanf(kv[1], "%d", &tcpPort)
-			case "REMOTE_UDP_PORT":
-				fmt.Sscanf(kv[1], "%d", &udpPort)
-			}
-		}
-		port, soft := 0, false
-		if tcpPort > 0 {
-			port = tcpPort
-		} else if udpPort > 0 {
-			port, soft = udpPort, true
-		} else {
+func nodeProbeTarget(r nodeRulePayload) (string, int, bool, bool) {
+	parsed := &Rule{EnableTCP: true, EnableUDP: true}
+	for _, line := range strings.Split(r.Env, "\n") {
+		kv := strings.SplitN(line, "=", 2)
+		if len(kv) != 2 {
 			continue
 		}
-		probes[r.Tag] = probeOne(host, port, soft)
+		switch kv[0] {
+		case "REMOTE_IP":
+			parsed.RemoteHost = kv[1]
+		case "REMOTE_TCP_PORT":
+			parsed.RemoteTCPPort, _ = strconv.Atoi(kv[1])
+		case "REMOTE_UDP_PORT":
+			parsed.RemoteUDPPort, _ = strconv.Atoi(kv[1])
+		case "ENABLE_TCP":
+			parsed.EnableTCP = kv[1] != "0"
+		case "ENABLE_UDP":
+			parsed.EnableUDP = kv[1] != "0"
+		}
 	}
-	return probes
+	if parsed.RemoteHost == "" {
+		return "", 0, false, false
+	}
+	return ruleProbeTarget(parsed)
+}
+
+// probeRemotes returns cached results immediately and starts at most one bounded
+// batch per minute. Slow targets never block configuration pulls or quota checks.
+func (s *Slave) probeRemotes(pr *pullResponse) map[string]*ProbeResult {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	out := map[string]*ProbeResult{}
+	for _, r := range pr.Rules {
+		if p := s.probeResults[r.Tag]; p != nil {
+			cp := *p
+			out[r.Tag] = &cp
+		}
+	}
+	if s.run.DryRun || s.probeRunning || time.Since(s.probeLast) < time.Minute {
+		return out
+	}
+	rules := append([]nodeRulePayload(nil), pr.Rules...)
+	s.probeRunning = true
+	s.probeLast = time.Now()
+	go func() {
+		results := map[string]*ProbeResult{}
+		var mu sync.Mutex
+		jobs := make(chan nodeRulePayload)
+		var wg sync.WaitGroup
+		for i := 0; i < 4; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for r := range jobs {
+					host, port, soft, ok := nodeProbeTarget(r)
+					if !ok {
+						continue
+					}
+					result := s.probe(host, port, soft)
+					mu.Lock()
+					results[r.Tag] = result
+					mu.Unlock()
+				}
+			}()
+		}
+		for _, r := range rules {
+			jobs <- r
+		}
+		close(jobs)
+		wg.Wait()
+		s.probeMu.Lock()
+		s.probeResults = results
+		s.probeRunning = false
+		s.probeMu.Unlock()
+	}()
+	return out
 }
 
 func (s *Slave) Run() {
@@ -286,8 +497,10 @@ func (s *Slave) Run() {
 		log.Printf("[slave] %v", err)
 	}
 	st := s.loadState()
+	if s.refreshKernelState(&st) {
+		s.saveState(st)
+	}
 	tcpVer := s.tcpPoolVersion()
-	s.overQuotaSent = map[string]bool{}
 	interval := 5 * time.Second
 	mode := "systemd"
 	if s.direct {
@@ -300,30 +513,38 @@ func (s *Slave) Run() {
 		err := s.request("POST", "/api/node/pull", map[string]string{}, &pr)
 		if err != nil {
 			log.Printf("[slave] 拉取失败: %v", err)
-			// 拉取失败保持现状不动（避免主控抖动引发误清理）
+			// A missing master must not disable locally enforced quotas. Keep the
+			// last desired set, but do not reconcile potentially stale changes.
+			if _, changed := s.enforceQuotas(&pullResponse{Rules: st.Rules}, &st); changed {
+				s.saveState(st)
+			}
 		} else {
+			pr.Rules = validPulledRules(pr.Rules)
 			if pr.Interval >= 1 && pr.Interval <= 60 {
 				interval = time.Duration(pr.Interval) * time.Second
 			}
+			changed := s.syncQuotaState(&pr, &st)
+			if !slices.Equal(st.Rules, pr.Rules) {
+				st.Rules = append([]nodeRulePayload(nil), pr.Rules...)
+				changed = true
+			}
+			stats, quotaChanged := s.enforceQuotas(&pr, &st)
+			changed = quotaChanged || changed
 			if s.reconcile(&pr, &st) {
+				changed = true
+			}
+			if changed {
 				s.saveState(st)
 			}
-			// 直跑模式：崩溃/被杀的实例自愈
-			if s.proc != nil {
-				for _, r := range pr.Rules {
-					if r.Desired == "running" {
-						s.proc.EnsureAlive(r.Tag)
-					}
-				}
-			}
-			// 上报状态、流量统计与节点侧测活结果
+			s.ensureRunning(&pr, &st)
 			report := map[string]any{
 				"machine":          ReadMachineInfo(),
 				"tcp_pool_version": tcpVer,
 				"panel_version":    panelVersion,
-				"statuses":         s.collectStatuses(&pr),
-				"stats":            s.enforceQuotas(&pr),
+				"statuses":         s.collectStatuses(&pr, &st),
+				"stats":            stats,
 				"probes":           s.probeRemotes(&pr),
+				"cleanup_complete": pr.Deleting && len(pr.Rules) == 0 && len(st.Applied) == 0,
 				"error":            "",
 			}
 			if rerr := s.request("POST", "/api/node/report", report, nil); rerr != nil {
@@ -334,53 +555,96 @@ func (s *Slave) Run() {
 	}
 }
 
-// SelfInstall 单文件客户端自安装：解压 tcp_pool + 注册自启动服务（systemd 或 OpenRC）后退出。
+func shellQuote(arg string) string { return "'" + strings.ReplaceAll(arg, "'", "'\"'\"'") + "'" }
+
+// A root-readable launcher preserves arguments exactly across both init systems,
+// including certificate pinning and paths containing spaces or shell characters.
+func (s *Slave) launchScript(binPath string) string {
+	args := []string{binPath, "-slave", "-master", s.masterURL, "-node-key", s.nodeKey,
+		"-conf-dir", s.confDir, "-tcpool-bin", s.binPath,
+		"-state", filepath.Join(filepath.Dir(s.statePath), "panel.json")}
+	if s.direct {
+		args = append(args, "-direct")
+	}
+	if s.tlsFingerprint != "" {
+		args = append(args, "-tls-fingerprint", s.tlsFingerprint)
+	}
+	if s.tlsInsecure {
+		args = append(args, "-tls-insecure")
+	}
+	for i := range args {
+		args[i] = shellQuote(args[i])
+	}
+	return "#!/bin/sh\nexec " + strings.Join(args, " ") + "\n"
+}
+
+// SelfInstall installs and starts the service; lack of a supported init system
+// is reported instead of claiming the node has been started.
 func (s *Slave) SelfInstall(binPath string) error {
 	if err := s.EnsureEmbeddedTCPPool(); err != nil {
 		return err
 	}
-	if !hasSystemd() {
-		// OpenRC（Alpine 等）
-		_ = os.MkdirAll("/etc/init.d", 0o755)
-		script := `#!/sbin/openrc-run
-description="Relay Panel Slave Node Agent"
-command="` + binPath + `"
-command_args="-slave -master ` + s.masterURL + ` -node-key ` + s.nodeKey + `"
-command_background=true
-pidfile="/run/relay-panel-slave.pid"
-output_log="/var/log/relay-panel/slave.log"
-error_log="/var/log/relay-panel/slave.log"
-
-depend() {
-	need net
-	after firewall
-}
-`
-		if err := writeFileAtomic("/etc/init.d/relay-panel-slave", []byte(script), 0o755); err != nil {
-			return err
+	useSystemd := hasSystemd()
+	if !useSystemd {
+		for _, command := range []string{"rc-service", "rc-update"} {
+			if _, err := exec.LookPath(command); err != nil {
+				return fmt.Errorf("未找到 systemd 或 OpenRC（缺少 %s），请以 -slave 模式直接运行", command)
+			}
 		}
-		log.Printf("[slave] 已写入 OpenRC 服务 /etc/init.d/relay-panel-slave")
-		log.Printf("[slave] 启动：rc-service relay-panel-slave start && rc-update add relay-panel-slave default")
-		return nil
 	}
-	_ = writeFileAtomic("/etc/systemd/system/tcp-pool@.service", []byte(serviceTemplate), 0o644)
-	unit := `[Unit]
-Description=Relay Panel Slave Node Agent
-Wants=network-online.target
-After=network-online.target
+	return s.installService(binPath, useSystemd, "")
+}
 
-[Service]
-ExecStart=` + binPath + ` -slave -master ` + s.masterURL + ` -node-key ` + s.nodeKey + `
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-`
-	if err := writeFileAtomic("/etc/systemd/system/relay-panel-slave.service", []byte(unit), 0o644); err != nil {
+// root is empty in production and allows service installation to be exercised in
+// an isolated directory by tests without changing the host's init configuration.
+func (s *Slave) installService(binPath string, useSystemd bool, root string) error {
+	if root == "" {
+		root = string(filepath.Separator)
+	}
+	launcher := filepath.Join(filepath.Dir(s.statePath), "slave-launch")
+	if err := writeFileAtomic(launcher, []byte(s.launchScript(binPath)), 0o700); err != nil {
 		return err
 	}
-	_, _, _ = s.run.Run("systemctl", "daemon-reload")
+	if !useSystemd {
+		logDir := os.Getenv("PANEL_LOG_DIR")
+		if logDir == "" {
+			logDir = filepath.Join(root, "var/log/relay-panel")
+		}
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			return err
+		}
+		script := "#!/sbin/openrc-run\n" +
+			"description=\"Relay Panel Slave Node Agent\"\n" +
+			"command=" + shellQuote(launcher) + "\n" +
+			"command_background=true\n" +
+			"pidfile=" + shellQuote(filepath.Join(root, "run/relay-panel-slave.pid")) + "\n" +
+			"output_log=" + shellQuote(filepath.Join(logDir, "slave.log")) + "\n" +
+			"error_log=" + shellQuote(filepath.Join(logDir, "slave.log")) + "\n" +
+			"depend() { need net; after firewall; }\n"
+		if err := writeFileAtomic(filepath.Join(root, "etc/init.d/relay-panel-slave"), []byte(script), 0o700); err != nil {
+			return err
+		}
+		if _, _, err := s.run.Run("rc-update", "add", "relay-panel-slave", "default"); err != nil {
+			return err
+		}
+		if _, _, err := s.run.Run("rc-service", "relay-panel-slave", "restart"); err != nil {
+			return err
+		}
+		log.Printf("[slave] 已安装并启动 OpenRC 服务 relay-panel-slave")
+		return nil
+	}
+	paths := Paths{ConfDir: s.confDir, TCPPoolBin: s.binPath}
+	if err := writeFileAtomic(filepath.Join(root, "etc/systemd/system/tcp-pool@.service"), []byte(serviceTemplateFor(paths)), 0o644); err != nil {
+		return err
+	}
+	execPath := strconv.Quote(strings.ReplaceAll(strings.ReplaceAll(launcher, "%", "%%"), "$", "$$"))
+	unit := "[Unit]\nDescription=Relay Panel Slave Node Agent\nWants=network-online.target\nAfter=network-online.target\n\n[Service]\nExecStart=" + execPath + "\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n"
+	if err := writeFileAtomic(filepath.Join(root, "etc/systemd/system/relay-panel-slave.service"), []byte(unit), 0o644); err != nil {
+		return err
+	}
+	if _, _, err := s.run.Run("systemctl", "daemon-reload"); err != nil {
+		return err
+	}
 	if _, _, err := s.run.Run("systemctl", "enable", "relay-panel-slave"); err != nil {
 		return err
 	}

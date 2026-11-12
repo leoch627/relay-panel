@@ -215,31 +215,25 @@ type trafficRow struct {
 	Conns  uint64 `json:"conns"`
 }
 
-// Query 聚合一段时间：points 趋势、rows 分组、heatmap 热力图。
-// viewer==nil 或管理员看全部；普通用户只看自己的规则（含其已删规则的历史）。
+// Query uses hourly points for the last 24 hours and calendar-day totals for longer ranges.
+// Daily storage covers all long ranges, including seven days after raw buckets expire.
 func (tc *TrafficCollector) Query(rangeKey string, viewer *User) map[string]any {
-	now := time.Now()
-	var dur time.Duration
-	var pointCount int
-	switch rangeKey {
-	case "24h":
-		dur, pointCount = 24*time.Hour, 24
-	case "7d":
-		dur, pointCount = 7*24*time.Hour, 28
-	case "30d":
-		dur, pointCount = 30*24*time.Hour, 30
-	case "365d":
-		dur, pointCount = 365*24*time.Hour, 52
-	default:
-		rangeKey, dur, pointCount = "24h", 24*time.Hour, 24
-	}
-	start := now.Add(-dur)
+	return tc.queryAt(rangeKey, viewer, time.Now())
+}
 
-	// 规则归属/节点信息
-	type ruleMeta struct {
-		nodeID int64
-		owner  int64
+func (tc *TrafficCollector) queryAt(rangeKey string, viewer *User, now time.Time) map[string]any {
+	days := 0
+	switch rangeKey {
+	case "7d":
+		days = 7
+	case "30d":
+		days = 30
+	case "365d":
+		days = 365
+	default:
+		rangeKey = "24h"
 	}
+	type ruleMeta struct{ nodeID, owner int64 }
 	metas := map[string]ruleMeta{}
 	for _, r := range tc.store.ListRules(0, true) {
 		metas[r.Tag] = ruleMeta{r.NodeID, r.OwnerID}
@@ -254,94 +248,82 @@ func (tc *TrafficCollector) Query(rangeKey string, viewer *User) map[string]any 
 
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
-
-	// 粗范围用日桶，细范围用 5 分钟桶，避免双重计数
-	useDays := rangeKey == "30d" || rangeKey == "365d"
-	rowMap := map[string]*trafficRow{}
-	newRow := func(tag string) *trafficRow {
-		if r, ok := rowMap[tag]; ok {
-			return r
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	dayIndex := map[string]int{}
+	var points []trafficPoint
+	var start time.Time
+	if days > 0 {
+		start = today.AddDate(0, 0, 1-days)
+		stepDays := 1
+		if days == 365 {
+			stepDays = 7
 		}
-		m := metas[tag]
-		r := &trafficRow{Tag: tag, NodeID: m.nodeID}
-		rowMap[tag] = r
-		return r
-	}
-
-	// 趋势点（全规则合并）
-	points := make([]trafficPoint, pointCount)
-	var ptStart, ptStep int64
-	if rangeKey == "365d" {
-		ptStep = 7 * 86400
+		points = make([]trafficPoint, (days+stepDays-1)/stepDays)
+		for i := range points {
+			points[i].T = start.AddDate(0, 0, i*stepDays).Unix()
+		}
+		for i := 0; i < days; i++ {
+			dayIndex[start.AddDate(0, 0, i).Format("2006-01-02")] = i / stepDays
+		}
 	} else {
-		ptStep = int64(dur.Seconds()) / int64(pointCount)
+		start = now.Add(-24 * time.Hour).Truncate(time.Hour)
+		points = make([]trafficPoint, 25)
+		for i := range points {
+			points[i].T = start.Add(time.Duration(i) * time.Hour).Unix()
+		}
 	}
-	ptStart = now.Unix()/ptStep*ptStep - int64(pointCount-1)*ptStep
-
-	if !useDays {
+	rowMap := map[string]*trafficRow{}
+	add := func(tag string, b *bucketVal, idx int) {
+		if b == nil || idx < 0 || idx >= len(points) {
+			return
+		}
+		row := rowMap[tag]
+		if row == nil {
+			row = &trafficRow{Tag: tag, NodeID: metas[tag].nodeID}
+			rowMap[tag] = row
+		}
+		row.Up += b.Up
+		row.Down += b.Down
+		row.Conns += b.Conns
+		points[idx].Up += b.Up
+		points[idx].Down += b.Down
+	}
+	if days == 0 {
+		cutoff := now.Add(-24*time.Hour).Unix() / trafficBucketSec * trafficBucketSec
 		for tag, buckets := range tc.db.Buckets {
 			if !visible(tag) {
 				continue
 			}
-			row := newRow(tag)
-			for bs, b := range buckets {
-				if bs < start.Unix() {
+			for at, b := range buckets {
+				if at < cutoff || at > now.Unix() {
 					continue
 				}
-				row.Up += b.Up
-				row.Down += b.Down
-				row.Conns += b.Conns
-				idx := (bs - ptStart) / ptStep
-				if idx >= 0 && idx < int64(pointCount) {
-					points[idx].Up += b.Up
-					points[idx].Down += b.Down
-				}
+				add(tag, b, int((at-start.Unix())/3600))
 			}
 		}
 	}
-
-	// 日桶：热力图（总是）+ 粗范围的行与趋势点
-	heatStart := now.Add(-364 * 24 * time.Hour).Format("2006-01-02")
-	rangeStartKey := start.Format("2006-01-02")
+	heatStart, todayKey := today.AddDate(0, 0, -364).Format("2006-01-02"), today.Format("2006-01-02")
 	type dayAgg struct{ Up, Down uint64 }
 	heat := map[string]dayAgg{}
-	for tag, days := range tc.db.Days {
+	for tag, buckets := range tc.db.Days {
 		if !visible(tag) {
 			continue
 		}
-		for dk, d := range days {
-			if dk >= heatStart {
-				a := heat[dk]
-				a.Up += d.Up
-				a.Down += d.Down
-				heat[dk] = a
+		for day, b := range buckets {
+			if b == nil {
+				continue
 			}
-			if useDays && dk >= rangeStartKey {
-				row := newRow(tag)
-				row.Up += d.Up
-				row.Down += d.Down
-				row.Conns += d.Conns
+			if day >= heatStart && day <= todayKey {
+				a := heat[day]
+				a.Up += b.Up
+				a.Down += b.Down
+				heat[day] = a
+			}
+			if idx, ok := dayIndex[day]; days > 0 && ok {
+				add(tag, b, idx)
 			}
 		}
 	}
-	if useDays {
-		points = make([]trafficPoint, pointCount)
-		for dk, a := range heat {
-			if dk < rangeStartKey {
-				continue
-			}
-			t, err := time.ParseInLocation("2006-01-02", dk, time.Local)
-			if err != nil {
-				continue
-			}
-			idx := (t.Unix() + 12*3600 - ptStart) / ptStep //取当日中午对齐点
-			if idx >= 0 && idx < int64(pointCount) {
-				points[idx].Up += a.Up
-				points[idx].Down += a.Down
-			}
-		}
-	}
-
 	var totUp, totDown, totConn uint64
 	rows := make([]*trafficRow, 0, len(rowMap))
 	for _, r := range rowMap {
@@ -350,25 +332,14 @@ func (tc *TrafficCollector) Query(rangeKey string, viewer *User) map[string]any 
 		totDown += r.Down
 		totConn += r.Conns
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		return rows[i].Up+rows[i].Down > rows[j].Up+rows[j].Down
-	})
-
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Up+rows[i].Down > rows[j].Up+rows[j].Down })
 	heatList := make([]map[string]any, 0, len(heat))
-	for dk, a := range heat {
-		heatList = append(heatList, map[string]any{"date": dk, "up": a.Up, "down": a.Down})
+	for day, a := range heat {
+		heatList = append(heatList, map[string]any{"date": day, "up": a.Up, "down": a.Down})
 	}
-	sort.Slice(heatList, func(i, j int) bool {
-		return heatList[i]["date"].(string) < heatList[j]["date"].(string)
-	})
-
-	return map[string]any{
-		"range":   rangeKey,
-		"points":  points,
-		"rows":    rows,
-		"heatmap": heatList,
-		"totals":  map[string]uint64{"up": totUp, "down": totDown, "conns": totConn},
-	}
+	sort.Slice(heatList, func(i, j int) bool { return heatList[i]["date"].(string) < heatList[j]["date"].(string) })
+	return map[string]any{"range": rangeKey, "points": points, "rows": rows, "heatmap": heatList,
+		"totals": map[string]uint64{"up": totUp, "down": totDown, "conns": totConn}}
 }
 
 // StartTrafficCollector main 里启动；interval<=0 用默认 60s。

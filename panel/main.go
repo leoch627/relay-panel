@@ -71,6 +71,10 @@ func importRelays(path string) []*Rule {
 			cur.EnableTCP = v != "0"
 		case "ENABLE_UDP":
 			cur.EnableUDP = v != "0"
+		case "RATE_LIMIT_KBPS":
+			if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 10000000 {
+				cur.RateLimitKBps = n
+			}
 		default:
 			if _, ok := advancedSpec[k]; ok {
 				if n, err := strconv.Atoi(v); err == nil {
@@ -159,7 +163,7 @@ func main() {
 		}
 		if !*dryRun {
 			if !direct {
-				_ = writeFileAtomic("/etc/systemd/system/tcp-pool@.service", []byte(serviceTemplate), 0o644)
+				_ = writeFileAtomic("/etc/systemd/system/tcp-pool@.service", []byte(serviceTemplateFor(paths)), 0o644)
 			}
 			_ = os.MkdirAll(paths.ConfDir, 0o755)
 			_ = os.MkdirAll(filepath.Dir("/etc/relay-panel/slave-state.json"), 0o700)
@@ -172,6 +176,8 @@ func main() {
 			}
 		}
 		slave := NewSlave(*masterURL, *nodeKey, run, paths, tlsCfg, direct)
+		slave.tlsFingerprint = *tlsFp
+		slave.tlsInsecure = *tlsInsecure
 		if *stateFile != "" {
 			slave.statePath = filepath.Join(filepath.Dir(*stateFile), "slave-state.json")
 		}
@@ -244,7 +250,7 @@ func main() {
 
 	if !*dryRun {
 		// 确保 systemd 模板存在（与原版安装脚本相同路径）
-		_ = writeFileAtomic("/etc/systemd/system/tcp-pool@.service", []byte(serviceTemplate), 0o644)
+		_ = writeFileAtomic("/etc/systemd/system/tcp-pool@.service", []byte(serviceTemplateFor(paths)), 0o644)
 		_ = os.MkdirAll(paths.ConfDir, 0o755)
 		if err := sd.SyncAll(store.ListRules(0, true)); err != nil {
 			log.Printf("启动同步配置失败: %v", err)
@@ -277,7 +283,7 @@ func main() {
 		log.Printf("TLS 未启用（PANEL_TLS=0），节点通信为明文 HTTP")
 	}
 
-	api := &API{store: store, sd: sd, tuner: tuner, run: run, sessions: NewSessionCache(), tls: tlsCfg}
+	api := &API{store: store, sd: sd, tuner: tuner, run: run, tls: tlsCfg}
 	// 流量采样器（主控汇总本机 + 各节点上报的计数差量）
 	sampleInterval := 60 * time.Second
 	if v := os.Getenv("PANEL_SAMPLE_INTERVAL"); v != "" {
@@ -300,8 +306,11 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           logRequests(mux),
+		Handler:           logRequests(securityHeaders(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	scheme := "http"
@@ -317,6 +326,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("HTTP 服务退出: %v", err)
 	}
+}
+
+// panelCSP 只放行同源资源：前端不加载任何外部脚本、字体或接口。
+// style-src 需要 'unsafe-inline'，因为 Radix 与 sonner 会在运行时注入 <style>；
+// 主题初始化脚本因此单独成文件（web/theme-init.js），而不是内联。
+const panelCSP = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+	"connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", panelCSP)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "same-origin")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func logRequests(next http.Handler) http.Handler {

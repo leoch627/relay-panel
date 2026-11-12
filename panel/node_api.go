@@ -21,11 +21,12 @@ func (a *API) nodeAuth(r *http.Request) *Node {
 }
 
 type nodeRulePayload struct {
-	Tag      string `json:"tag"`
-	Revision int64  `json:"revision"`
-	Desired  string `json:"desired"`
-	Env      string `json:"env"`
-	Quota    int64  `json:"quota"` //流量配额字节，0不限；节点本地执行超限停机
+	Tag        string `json:"tag"`
+	Revision   int64  `json:"revision"`
+	Desired    string `json:"desired"`
+	Env        string `json:"env"`
+	Quota      int64  `json:"quota"` //流量配额字节，0不限；节点本地执行超限停机
+	QuotaReset int64  `json:"quota_reset"`
 }
 
 // handleNodePull 被控机拉取自己的期望规则集（全量下发，被控端做差量 reconcile）。
@@ -36,6 +37,9 @@ func (a *API) handleNodePull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rules := a.store.RulesOnNode(node.ID)
+	if node.Deleting {
+		rules = nil
+	}
 	payload := make([]nodeRulePayload, 0, len(rules))
 	for _, rl := range rules {
 		desired := rl.DesiredState
@@ -43,17 +47,19 @@ func (a *API) handleNodePull(w http.ResponseWriter, r *http.Request) {
 			desired = "running"
 		}
 		payload = append(payload, nodeRulePayload{
-			Tag:      rl.Tag,
-			Revision: rl.UpdatedAt.UnixMilli(),
-			Desired:  desired,
-			Env:      a.sd.EnvFileContent(rl),
-			Quota:    rl.TrafficQuotaBytes,
+			Tag:        rl.Tag,
+			Revision:   rl.UpdatedAt.UnixMilli(),
+			Desired:    desired,
+			Env:        a.sd.EnvFileContent(rl),
+			Quota:      rl.TrafficQuotaBytes,
+			QuotaReset: rl.QuotaReset,
 		})
 	}
 	writeJSON(w, 200, map[string]any{
 		"node_id":  node.ID,
 		"interval": nodePullIntervalSec,
 		"rules":    payload,
+		"deleting": node.Deleting,
 	})
 }
 
@@ -65,22 +71,33 @@ func (a *API) handleNodeReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Machine       MachineInfo             `json:"machine"`
-		TCPoolVersion string                  `json:"tcp_pool_version"`
-		PanelVersion  string                  `json:"panel_version"`
-		Statuses      map[string]UnitStatus   `json:"statuses"`
-		Stats         map[string]*RuleStats   `json:"stats"`
-		Probes        map[string]*ProbeResult `json:"probes"`
-		Error         string                  `json:"error"`
+		Machine         MachineInfo             `json:"machine"`
+		TCPoolVersion   string                  `json:"tcp_pool_version"`
+		PanelVersion    string                  `json:"panel_version"`
+		Statuses        map[string]UnitStatus   `json:"statuses"`
+		Stats           map[string]*RuleStats   `json:"stats"`
+		Probes          map[string]*ProbeResult `json:"probes"`
+		Error           string                  `json:"error"`
+		CleanupComplete bool                    `json:"cleanup_complete"`
 	}
 	if err := readBody(r, &req); err != nil {
 		errJSON(w, 400, "请求格式错误")
 		return
 	}
+	if node.Deleting && req.CleanupComplete && len(req.Statuses) == 0 && req.Error == "" {
+		if err := a.store.CompleteNodeDeletion(node.ID); err != nil {
+			errJSON(w, 500, "保存清理结果失败: "+err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]string{"ok": "1"})
+		return
+	}
 	//节点上报的超限信息直接落到规则上（节点已在本地停机）
 	for tag, st := range req.Stats {
 		if st != nil && st.OverQuota {
-			a.store.SetRuleOverQuota(tag, true)
+			if rule := a.store.GetRule(tag); rule != nil && rule.NodeID == node.ID && rule.QuotaReset == st.QuotaReset {
+				a.store.SetRuleOverQuota(tag, true)
+			}
 		}
 	}
 	rep := NodeReport{
@@ -109,25 +126,39 @@ func (a *API) handleNodesList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodes := a.store.ListNodes()
+	// 普通用户只能看到自己的规则：节点上报的实例状态与转发数都按归属过滤，
+	// 避免泄露其他用户的规则标签。
 	ruleCount := map[int64]int{}
-	for _, rl := range a.store.ListRules(0, true) {
+	visible := map[string]bool{}
+	for _, rl := range a.store.ListRules(u.ID, u.IsAdmin) {
 		ruleCount[rl.NodeID]++
+		visible[rl.Tag] = true
 	}
 	out := make([]map[string]any, 0, len(nodes))
 	for _, n := range nodes {
 		rep := ParseNodeReport(n)
+		statuses := rep.Statuses
+		if !u.IsAdmin {
+			statuses = map[string]UnitStatus{}
+			for tag, st := range rep.Statuses {
+				if visible[tag] {
+					statuses[tag] = st
+				}
+			}
+		}
 		row := map[string]any{
 			"id":         n.ID,
 			"name":       n.Name,
 			"online":     NodeOnline(n),
 			"last_seen":  isoTime(n.LastSeen),
 			"rule_count": ruleCount[n.ID],
+			"deleting":   n.Deleting,
 			"report": map[string]any{
 				"at":       isoTime(rep.At),
 				"machine":  rep.Machine,
 				"tcp_pool": rep.TCPoolVersion,
 				"panel":    rep.PanelVersion,
-				"statuses": rep.Statuses,
+				"statuses": statuses,
 			},
 		}
 		if u.IsAdmin {
@@ -183,14 +214,13 @@ func (a *API) handleNodeDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, 404, "节点不存在")
 		return
 	}
-	// 级联删除该节点名下规则；节点已失联时其机器上的实例需人工清理
-	n := a.store.DeleteRulesByNode(id)
-	if err := a.store.DeleteNode(id); err != nil {
+	// Keep the node credential so it can pull an empty set and acknowledge cleanup.
+	n, err := a.store.BeginDeleteNode(id)
+	if err != nil {
 		errJSON(w, 500, "删除节点失败: "+err.Error())
 		return
 	}
-	a.sd.SyncAll(a.store.ListRules(0, true))
-	writeJSON(w, 200, map[string]any{"ok": "1", "rules_removed": n})
+	writeJSON(w, 200, map[string]any{"ok": "1", "rules_removed": n, "pending": true})
 }
 
 func (a *API) handleNodeRegenKey(w http.ResponseWriter, r *http.Request) {
