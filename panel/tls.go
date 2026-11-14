@@ -151,18 +151,20 @@ func LoadTLS(tlsMode, certFile, keyFile, stateDir string) (*TLSConfig, error) {
 	return GenerateSelfSigned(defCert, defKey)
 }
 
-// SlaveTLSClient 被控机的 TLS 校验策略：优先指纹固定；未给指纹则退化为不校验（明示风险）。
+// SlaveTLSClient 被控机的 TLS 校验策略：优先指纹固定；未给指纹时按系统 CA 校验，
+// 仅在显式 insecure 时跳过校验。
 func SlaveTLSClient(fingerprint string, insecure bool) *tls.Config {
 	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
 	if fingerprint != "" {
 		want := fingerprint
 		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			for _, raw := range rawCerts {
-				if sha256Fingerprint(raw) == want {
-					return nil
-				}
+			// 只认叶子证书：握手只证明对端持有 rawCerts[0] 的私钥，链上其余证书
+			// 可由对端任意附带。主控证书是公开的，若匹配整条链，中间人把它附在
+			// 自己的叶子证书后面即可通过校验。
+			if len(rawCerts) == 0 || sha256Fingerprint(rawCerts[0]) != want {
+				return fmt.Errorf("主控证书指纹不匹配（期望 %s）", want)
 			}
-			return fmt.Errorf("主控证书指纹不匹配（期望 %s）", want)
+			return nil
 		}
 		//指纹固定时跳过系统 CA 校验（自签场景），安全性由指纹保证
 		cfg.InsecureSkipVerify = true
