@@ -29,6 +29,22 @@ curl -fsSL https://raw.githubusercontent.com/leoch627/relay-panel/main/panel_ins
 
 > 面板安装（panel_install.sh）只安装 `tcp_pool` 内核、面板二进制和两个 systemd 单元，**不安装任何 `relay` 命令**。仓库根目录的 `install.sh` 是上游内核项目的原始 CLI 安装器，仅供直接使用内核（不要面板）的场景，与面板无关。
 
+## 升级
+
+管理员在「系统调优」页的「版本与升级」卡片里操作：
+
+- **检查更新**：读取本仓库 GitHub Releases 的最新发布。只在打开该页或点击按钮时访问 GitHub，没有后台定时检查。
+- **升级主控**：下载与架构匹配的发行包，按同一发布里的 `SHA256SUMS` 校验，并确认其自报版本与标签一致，然后替换面板程序并原地重启（旧版本保留为 `relay-panel.bak`）。Docker 部署不支持，请拉取新镜像重建容器。
+- **升级节点**：主控只向节点下发版本标签，节点自行从 GitHub 下载并做同样的校验后重启代理。节点只升不降，也不接受主控给出的下载地址。systemd 节点的转发不中断；直跑模式的节点会短暂重启转发实例。
+
+注意事项：
+
+- 节点从 v1.2.0 起支持远程升级；更早的节点需在节点上重新执行一次安装命令。
+- 主控和节点都需要能访问 `github.com`；可在服务环境里设置 `HTTPS_PROXY`。`PANEL_UPDATE_REPO=owner/name` 可改用自己的仓库，`PANEL_SELF_UPDATE=0` 关闭在线升级。
+- 校验清单与发行包来自同一个发布，能发现下载损坏，但不等同于签名：发布的可信度取决于仓库的发布权限。
+- 主控本机的 `tcp_pool` 内核不随面板升级，仍由安装脚本更新。
+- 发布方式：把 `panel/api.go` 的 `panelSemver` 改为新版本号，推送同名标签 `vX.Y.Z`，CI 会构建并上传发行包与 `SHA256SUMS`（标签与版本号不一致时构建失败）。
+
 ## Docker
 
 ```bash

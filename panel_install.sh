@@ -189,7 +189,7 @@ install_panel_bin() {
        [ -f "$prebuilt.sha256" ] &&
        (cd "$SRC_DIR" && sha256sum -c dist/panel-sources.sha256 >/dev/null 2>&1 &&
         sha256sum -c "dist/relay-panel-linux-$ARCH.sha256" >/dev/null 2>&1) &&
-       "$prebuilt" -version 2>/dev/null | grep -q 'relay-panel v1.1.0'; then
+       "$prebuilt" -version 2>/dev/null | grep -q '^relay-panel v[0-9]'; then
         install_binary_atomic "$prebuilt" "$PANEL_BIN"
         echo "面板二进制已校验，与当前源码一致。"
         return 0
@@ -213,7 +213,7 @@ if [ "$PANEL_SLAVE" = "1" ]; then
             return 1
         fi
         chmod +x "$tmp"
-        if "$tmp" -version 2>/dev/null | grep -q 'relay-panel v1.1.0'; then
+        if "$tmp" -version 2>/dev/null | grep -q '^relay-panel v[0-9]'; then
             mv -f "$tmp" "$PANEL_BIN"
             echo "单文件客户端就绪（内嵌 musl tcp_pool，免编译）。"
             return 0

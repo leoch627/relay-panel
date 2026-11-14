@@ -10,6 +10,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Meter } from "@/components/ui/misc";
 import { ErrorBanner, LoadingState, PageHeader } from "@/components/common";
 import { confirm } from "@/components/confirm";
+import { UpdateCard } from "@/views/system/UpdateCard";
 
 const PROFILE_ICON: Record<string, typeof Feather> = { conservative: Feather, standard: Scale, aggressive: Rocket };
 
@@ -39,8 +40,9 @@ export function System() {
 
   return (
     <div>
-      <PageHeader title="系统调优" description="主控服务器的 BBR 拥塞控制与 TCP 内核参数。仅管理员可操作，被控节点不受影响。" />
+      <PageHeader title="系统调优" description="面板版本升级，以及主控服务器的 BBR 拥塞控制与 TCP 内核参数。仅管理员可操作，调优不影响被控节点。" />
       <ErrorBanner message={error} />
+      <UpdateCard />
 
       <Card className={cn("relative overflow-hidden", t.bbr_active ? "" : "border-primary/30")}>
         <div className={cn("absolute inset-y-0 left-0 w-1", t.bbr_active ? "bg-success" : t.bbr_supported ? "bg-primary" : "bg-muted-foreground/40")} />

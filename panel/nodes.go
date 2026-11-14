@@ -15,9 +15,10 @@ type Node struct {
 	Name       string    `json:"name"`
 	Key        string    `json:"key"`
 	CreatedAt  time.Time `json:"created_at"`
-	LastSeen   time.Time `json:"last_seen"`   // 最近一次心跳
-	ReportJSON string    `json:"report_json"` // 最近一次上报原文
-	Deleting   bool      `json:"deleting"`    //保留密钥直到节点确认已清理实例
+	LastSeen   time.Time `json:"last_seen"`            // 最近一次心跳
+	ReportJSON string    `json:"report_json"`          // 最近一次上报原文
+	Deleting   bool      `json:"deleting"`             //保留密钥直到节点确认已清理实例
+	UpgradeTo  string    `json:"upgrade_to,omitempty"` //管理员要求升级到的版本标签，节点达到后清除
 }
 
 func cloneNode(n *Node) *Node { cp := *n; return &cp }
@@ -32,6 +33,7 @@ type NodeReport struct {
 	Stats         map[string]*RuleStats   `json:"stats,omitempty"`
 	Probes        map[string]*ProbeResult `json:"probes,omitempty"` //节点侧定期测活
 	Error         string                  `json:"error,omitempty"`
+	UpgradeError  string                  `json:"upgrade_error,omitempty"` //节点最近一次在线升级失败的原因
 }
 
 // ---------- store：nodes ----------
@@ -169,6 +171,28 @@ func (s *Store) CompleteNodeDeletion(id int64) error {
 		return err
 	}
 	return nil
+}
+
+// SetNodeUpgrade 记录（或以空串清除）节点的目标版本；值未变化时不落盘。
+func (s *Store) SetNodeUpgrade(id int64, tag string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range s.st.Nodes {
+		if n.ID != id {
+			continue
+		}
+		if n.UpgradeTo == tag {
+			return nil
+		}
+		old := n.UpgradeTo
+		n.UpgradeTo = tag
+		if err := s.saveLocked(); err != nil {
+			n.UpgradeTo = old
+			return err
+		}
+		return nil
+	}
+	return ErrNotFound
 }
 
 // TouchNode 更新心跳与上报原文；超过 30s 才落盘一次，避免高频写 JSON。

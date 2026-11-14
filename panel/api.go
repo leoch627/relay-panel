@@ -15,7 +15,11 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const panelVersion = "relay-panel v1.1.0 (tcp_pool v1.8)"
+// panelSemver 是版本号的唯一来源：发布标签必须是 "v"+panelSemver（CI 会校验），
+// 在线升级据此比较新旧。
+const panelSemver = "1.2.0"
+
+const panelVersion = "relay-panel v" + panelSemver + " (tcp_pool v1.8)"
 
 type API struct {
 	store   *Store
@@ -25,6 +29,7 @@ type API struct {
 	tls     *TLSConfig
 	traffic *TrafficCollector
 	prober  *Prober
+	updater *Updater
 }
 
 func (a *API) tlsFingerprint() string {
@@ -797,6 +802,8 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/system", a.handleSystemStatus)
 	mux.HandleFunc("POST /api/system/bbr", a.handleApplyBBR)
 	mux.HandleFunc("POST /api/system/tuning", a.handleApplyTuning)
+	mux.HandleFunc("GET /api/system/update", a.handleUpdateStatus)
+	mux.HandleFunc("POST /api/system/update", a.handleUpdateApply)
 	mux.HandleFunc("GET /api/tls", a.handleTLSInfo)
 	mux.HandleFunc("GET /api/traffic", a.handleTraffic)
 	// 节点（主从）
@@ -804,6 +811,7 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/nodes", a.handleNodeCreate)
 	mux.HandleFunc("DELETE /api/nodes/{id}", a.handleNodeDelete)
 	mux.HandleFunc("POST /api/nodes/{id}/key", a.handleNodeRegenKey)
+	mux.HandleFunc("POST /api/nodes/upgrade", a.handleNodesUpgrade)
 	// 被控机专用（Bearer 节点密钥）
 	mux.HandleFunc("POST /api/node/pull", a.handleNodePull)
 	mux.HandleFunc("POST /api/node/report", a.handleNodeReport)

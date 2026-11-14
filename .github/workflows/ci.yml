@@ -118,6 +118,15 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -tags embed_tcpool -trimpath -ldflags="-s -w" -o ../dist/relay-panel-client-linux-arm64 .
           cd ..
           chmod +x dist/*
+          # 在线升级按此清单校验下载的发行包（主控与节点都会读取）
+          (cd dist && sha256sum relay-panel-linux-amd64 relay-panel-linux-arm64 relay-panel-linux-armv7 \
+              relay-panel-client-linux-amd64 relay-panel-client-linux-arm64 > SHA256SUMS && cat SHA256SUMS)
+      - name: Release tag must match panel version
+        if: github.ref_type == 'tag'
+        run: |
+          # 在线升级会核对发行包自报版本与标签一致，不一致的发布无法被安装
+          dist/relay-panel-linux-amd64 -version | grep -q "^relay-panel ${GITHUB_REF_NAME} " || {
+            echo "标签 ${GITHUB_REF_NAME} 与 panel/api.go 的 panelSemver 不一致"; exit 1; }
       - name: Verify static linking
         run: |
           file dist/tcp_pool-linux-*-musl dist/relay-panel-client-linux-* | tee /tmp/file.txt

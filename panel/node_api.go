@@ -55,12 +55,17 @@ func (a *API) handleNodePull(w http.ResponseWriter, r *http.Request) {
 			QuotaReset: rl.QuotaReset,
 		})
 	}
-	writeJSON(w, 200, map[string]any{
+	resp := map[string]any{
 		"node_id":  node.ID,
 		"interval": nodePullIntervalSec,
 		"rules":    payload,
 		"deleting": node.Deleting,
-	})
+	}
+	// 只下发版本标签；节点自行从本机配置的仓库下载并校验，且只升不降
+	if node.UpgradeTo != "" && !node.Deleting {
+		resp["upgrade_to"] = node.UpgradeTo
+	}
+	writeJSON(w, 200, resp)
 }
 
 // handleNodeReport 被控机上报各实例状态与机器信息。
@@ -78,6 +83,7 @@ func (a *API) handleNodeReport(w http.ResponseWriter, r *http.Request) {
 		Stats           map[string]*RuleStats   `json:"stats"`
 		Probes          map[string]*ProbeResult `json:"probes"`
 		Error           string                  `json:"error"`
+		UpgradeError    string                  `json:"upgrade_error"`
 		CleanupComplete bool                    `json:"cleanup_complete"`
 	}
 	if err := readBody(r, &req); err != nil {
@@ -100,6 +106,16 @@ func (a *API) handleNodeReport(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	//节点已达到目标版本：升级完成，清除标记
+	if node.UpgradeTo != "" {
+		target, _ := parseSemver(node.UpgradeTo)
+		if got, ok := versionFromBanner(req.PanelVersion); ok && !target.newerThan(got) {
+			_ = a.store.SetNodeUpgrade(node.ID, "")
+		}
+	}
+	if msg := []rune(req.UpgradeError); len(msg) > 300 {
+		req.UpgradeError = string(msg[:300])
+	}
 	rep := NodeReport{
 		At:            time.Now(),
 		Machine:       req.Machine,
@@ -109,6 +125,7 @@ func (a *API) handleNodeReport(w http.ResponseWriter, r *http.Request) {
 		Stats:         req.Stats,
 		Probes:        req.Probes,
 		Error:         req.Error,
+		UpgradeError:  req.UpgradeError,
 	}
 	if rep.Statuses == nil {
 		rep.Statuses = map[string]UnitStatus{}

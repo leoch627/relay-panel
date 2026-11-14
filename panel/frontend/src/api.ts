@@ -31,6 +31,16 @@ export interface Overview {
   users_total?: number; machine?: MachineInfo; tuning?: TuningStatus;
 }
 
+export interface UpdateNode { id: number; name: string; online: boolean; version: string; upgrade_to: string; supported: boolean; outdated: boolean; error: string }
+export interface UpdateInfo {
+  current: string;
+  latest: { tag: string; url: string; notes: string; published_at: string } | null;
+  has_update: boolean; checked_at: string; check_error: string; repo: string;
+  self_update: boolean; self_update_reason: string;
+  status: { phase: "idle" | "downloading" | "restarting" | "failed"; message: string; target: string };
+  nodes: UpdateNode[];
+}
+
 export type ApiError = { error: string };
 let onUnauthorized: (() => void) | null = null;
 export function setOnUnauthorized(fn: () => void) { onUnauthorized = fn; }

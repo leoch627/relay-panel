@@ -283,7 +283,7 @@ func main() {
 		log.Printf("TLS 未启用（PANEL_TLS=0），节点通信为明文 HTTP")
 	}
 
-	api := &API{store: store, sd: sd, tuner: tuner, run: run, tls: tlsCfg}
+	api := &API{store: store, sd: sd, tuner: tuner, run: run, tls: tlsCfg, updater: NewUpdater(*dryRun, false)}
 	// 流量采样器（主控汇总本机 + 各节点上报的计数差量）
 	sampleInterval := 60 * time.Second
 	if v := os.Getenv("PANEL_SAMPLE_INTERVAL"); v != "" {

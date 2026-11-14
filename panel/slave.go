@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
@@ -40,6 +41,19 @@ type Slave struct {
 	probeLast      time.Time
 	probeRunning   bool
 	probe          func(string, int, bool) *ProbeResult
+	updater        *Updater
+	upgradeMu      sync.Mutex
+	upgrade        slaveUpgrade
+}
+
+// slaveUpgrade 记录在线升级的进度。下载在后台进行，不阻塞配置拉取与配额巡检；
+// 替换与重启只在主循环的安全点执行。
+type slaveUpgrade struct {
+	running bool
+	tried   string // 最近一次尝试的目标版本
+	triedAt time.Time
+	ready   string // 已下载并校验、等待安装的临时文件
+	err     string // 最近一次失败原因，随上报回传主控
 }
 
 type slaveState struct {
@@ -71,6 +85,7 @@ func NewSlave(masterURL, nodeKey string, run *Runner, p Paths, tlsCfg *tls.Confi
 		client:       &http.Client{Timeout: 15 * time.Second, Transport: transport},
 		probeResults: map[string]*ProbeResult{},
 		probe:        probeOne,
+		updater:      NewUpdater(run.DryRun, true),
 	}
 	if direct {
 		s.proc = NewProcessManager(run, p)
@@ -107,11 +122,12 @@ func (s *Slave) EnsureEmbeddedTCPPool() error {
 }
 
 type pullResponse struct {
-	NodeID   int64             `json:"node_id"`
-	Interval int               `json:"interval"`
-	Rules    []nodeRulePayload `json:"rules"`
-	Error    string            `json:"error"`
-	Deleting bool              `json:"deleting"`
+	NodeID    int64             `json:"node_id"`
+	Interval  int               `json:"interval"`
+	Rules     []nodeRulePayload `json:"rules"`
+	Error     string            `json:"error"`
+	Deleting  bool              `json:"deleting"`
+	UpgradeTo string            `json:"upgrade_to"` // 主控要求升级到的版本标签
 }
 
 func (s *Slave) request(method, path string, body any, out any) error {
@@ -552,6 +568,85 @@ func (s *Slave) Run() {
 			}
 		}
 		time.Sleep(interval)
+	}
+}
+
+func (s *Slave) upgradeError() string {
+	s.upgradeMu.Lock()
+	defer s.upgradeMu.Unlock()
+	return s.upgrade.err
+}
+
+// checkUpgrade 在主循环每轮末尾调用：已有校验通过的新版本就安装并重启，否则按
+// 主控给出的版本标签在后台下载。标签只用于拼出本机配置仓库的发布地址，且只接受
+// 比当前更高的版本，主控无法借此让节点执行任意文件或降级。
+func (s *Slave) checkUpgrade(target string) {
+	u := s.updater
+	if u == nil {
+		return
+	}
+	s.upgradeMu.Lock()
+	ready := s.upgrade.ready
+	s.upgrade.ready = ""
+	s.upgradeMu.Unlock()
+	if ready != "" {
+		s.applyUpgrade(ready)
+		return
+	}
+
+	if target == "" {
+		return
+	}
+	want, ok := parseSemver(target)
+	if !ok || !releaseTagRe.MatchString(target) || !want.newerThan(u.current) {
+		return // 标签不合法、已达到或高于目标：忽略
+	}
+	s.upgradeMu.Lock()
+	defer s.upgradeMu.Unlock()
+	if u.disabledReason != "" {
+		s.upgrade.err = u.disabledReason
+		return
+	}
+	if s.upgrade.running || (s.upgrade.tried == target && time.Since(s.upgrade.triedAt) < updateRetryAfter) {
+		return
+	}
+	s.upgrade.running, s.upgrade.tried, s.upgrade.triedAt = true, target, time.Now()
+	log.Printf("[slave] 主控要求升级到 %s，开始下载", target)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), updateTimeout)
+		defer cancel()
+		tmp, err := u.Fetch(ctx, target)
+		s.upgradeMu.Lock()
+		defer s.upgradeMu.Unlock()
+		s.upgrade.running = false
+		if err != nil {
+			log.Printf("[slave] 下载 %s 失败（%v 后重试）: %v", target, updateRetryAfter, err)
+			s.upgrade.err = err.Error()
+			return
+		}
+		s.upgrade.err = ""
+		s.upgrade.ready = tmp
+	}()
+}
+
+func (s *Slave) applyUpgrade(tmp string) {
+	fail := func(err error) {
+		log.Printf("[slave] 升级失败: %v", err)
+		s.upgradeMu.Lock()
+		s.upgrade.err = err.Error()
+		s.upgradeMu.Unlock()
+	}
+	if err := s.updater.Install(tmp); err != nil {
+		fail(err)
+		return
+	}
+	log.Printf("[slave] 新版本已安装，重新启动代理")
+	if s.proc != nil {
+		s.proc.StopAll() // 直跑实例随代理重启；systemd 实例不受影响
+	}
+	if err := s.updater.restart(); err != nil {
+		// 仍在运行旧代码；直跑实例由下一轮 ensureRunning 拉起
+		fail(fmt.Errorf("新版本已安装，但重新启动失败，请手动重启节点服务: %w", err))
 	}
 }
 

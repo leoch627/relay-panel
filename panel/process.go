@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -155,6 +156,18 @@ func (m *ProcessManager) StopRule(tag string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.killLocked(tag)
+}
+
+// StopAll 停止全部直跑实例。代理原地重新执行前调用：新进程不认识旧进程留下的
+// 子进程，不先停掉它们就会变成占着端口、无法管理的孤儿。
+func (m *ProcessManager) StopAll() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for tag := range m.children {
+		if err := m.killLocked(tag); err != nil {
+			log.Printf("[slave] 升级前停止实例 %s 失败: %v", tag, err)
+		}
+	}
 }
 
 func (m *ProcessManager) DeleteUnit(tag string) error {
