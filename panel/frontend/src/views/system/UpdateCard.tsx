@@ -87,13 +87,13 @@ export function UpdateCard() {
     } catch (e) { toast.error(errMsg(e)); } finally { setBusy(null); }
   };
 
-  const tone = data.has_update ? "bg-primary" : data.check_error && !latest ? "bg-muted-foreground/40" : "bg-success";
+  const tone = data.has_update ? "bg-primary" : latest ? "bg-success" : "bg-muted-foreground/40";
 
   return (
     <Card className={cn("relative mb-4 overflow-hidden", data.has_update && "border-primary/30")}>
       <div className={cn("absolute inset-y-0 left-0 w-1", tone)} />
       <div className="flex flex-wrap items-center gap-5 p-5 pl-6">
-        <div className={cn("grid h-12 w-12 shrink-0 place-items-center rounded-xl", data.has_update ? "bg-primary/10 text-primary" : "bg-success/10 text-success")}>
+        <div className={cn("grid h-12 w-12 shrink-0 place-items-center rounded-xl", data.has_update ? "bg-primary/10 text-primary" : latest ? "bg-success/10 text-success" : "bg-muted text-muted-foreground")}>
           <ArrowUpCircle className="h-6 w-6" />
         </div>
         <div className="min-w-0 flex-1">
@@ -152,10 +152,13 @@ export function UpdateCard() {
               const st = nodeState(n);
               return (
                 <li key={n.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-[13px]">
-                  <StatusDot tone={n.online ? "success" : "secondary"} />
-                  <span className="min-w-0 max-w-[40%] truncate font-medium">{n.name}</span>
-                  <span className="font-mono text-xs text-muted-foreground">{n.version || "-"}</span>
-                  <span className={cn("min-w-0 flex-1 break-words", stateClass[st.tone])}>{st.text}</span>
+                  <div className="flex min-w-0 flex-1 items-center gap-3 sm:max-w-[45%] sm:flex-none">
+                    <StatusDot tone={n.online ? "success" : "secondary"} />
+                    <span className="min-w-0 truncate font-medium">{n.name}</span>
+                    <span className="font-mono text-xs text-muted-foreground">{n.version || "-"}</span>
+                  </div>
+                  {/* 窄屏下状态文字单独占一行，避免被名称和按钮挤成竖排 */}
+                  <span className={cn("order-last min-w-0 basis-full break-words pl-5 sm:order-none sm:basis-0 sm:flex-1 sm:pl-0", stateClass[st.tone])}>{st.text}</span>
                   {n.upgrade_to ? (
                     <Button size="xs" variant="ghost" disabled={busy !== null} onClick={() => upgradeNodes({ ids: [n.id], cancel: true }, `n${n.id}`)}>
                       {busy === `n${n.id}` ? <Loader2 className="animate-spin" /> : <X />}取消

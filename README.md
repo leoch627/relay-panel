@@ -43,13 +43,17 @@ curl -fsSL https://raw.githubusercontent.com/leoch627/relay-panel/main/panel_ins
 - 主控和节点都需要能访问 `github.com`；可在服务环境里设置 `HTTPS_PROXY`。`PANEL_UPDATE_REPO=owner/name` 可改用自己的仓库，`PANEL_SELF_UPDATE=0` 关闭在线升级。
 - 校验清单与发行包来自同一个发布，能发现下载损坏，但不等同于签名：发布的可信度取决于仓库的发布权限。
 - 主控本机的 `tcp_pool` 内核不随面板升级，仍由安装脚本更新。
-- 发布方式：把 `panel/api.go` 的 `panelSemver` 改为新版本号，推送同名标签 `vX.Y.Z`，CI 会构建并上传发行包与 `SHA256SUMS`（标签与版本号不一致时构建失败）。
+- 发布方式：把 `panel/api.go` 的 `panelSemver` 改为新版本号，推送同名标签 `vX.Y.Z`，CI 会构建并上传发行包与 `SHA256SUMS`（标签与版本号不一致时构建失败），同时发布同版本的 Docker 镜像。
 
 ## Docker
 
 ```bash
-docker compose up -d --build   # http://服务器IP:8081
+docker compose up -d           # 拉取预构建镜像，http://服务器IP:8081
+docker compose up -d --build   # 或者用本地源码构建
 ```
+
+- **镜像**：CI 发布多架构镜像（amd64 / arm64 / armv7）到 `ghcr.io/leoch627/relay-panel`。`latest` 与 `X.Y.Z` 对应 `vX.Y.Z` 标签的发布，`edge` 跟随主分支。
+- **升级**：`docker compose pull && docker compose up -d`。容器内不提供「升级主控」，但系统页仍可检查更新并升级被控节点。
 
 - **单端口复用**：页面、面板 API、节点轮询 API 全部走同一个端口（默认 8081），不额外监听
 - **反代 / Cloudflare**：镜像默认 `PANEL_TLS=0`，由反代终止 TLS；面板按 `X-Forwarded-Proto` 自动适配 Secure Cookie，访问地址（节点安装命令里的 master URL）自动跟随浏览器当前域名/协议。套 CF 时被控机安装命令**不带** `PANEL_TLS_FP`（CF 边缘证书非固定自签证书，节点用系统 CA 校验即可），CF 回源模式选 Full（接受自签源站证书）——或干脆主控保持 `PANEL_TLS=0` 走 HTTP 回源

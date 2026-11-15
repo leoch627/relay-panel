@@ -1,7 +1,8 @@
 services:
   relay-panel:
+    # 默认拉取 CI 发布的多架构镜像；想用本地源码构建就加 --build
+    image: ghcr.io/leoch627/relay-panel:latest
     build: .
-    image: relay-panel:latest
     container_name: relay-panel
     ports:
       - "8081:8081"          # 页面 / 面板 API / 节点轮询共用这一个端口

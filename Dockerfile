@@ -1,5 +1,6 @@
 # ---------- 前端：React + shadcn/ui ----------
-FROM node:20-alpine AS fe
+# 前端产物与架构无关：固定在构建机架构上跑，多架构构建时不走 QEMU
+FROM --platform=$BUILDPLATFORM node:20-alpine AS fe
 WORKDIR /build/panel/frontend
 COPY panel/frontend/package.json panel/frontend/package-lock.json* panel/frontend/.npmrc ./
 RUN npm ci --no-audit --no-fund
@@ -8,19 +9,24 @@ COPY panel/frontend/ ./
 RUN npm run typecheck && npm test && npm run build
 
 # ---------- 后端：Go 静态二进制（embed 前端产物） ----------
-FROM golang:1.25-alpine AS be
+# 在构建机架构上交叉编译到目标架构（buildx 注入 TARGETOS/TARGETARCH）
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS be
+ARG TARGETOS=linux
+ARG TARGETARCH
+ARG TARGETVARIANT
 WORKDIR /src
 COPY panel/go.mod panel/go.sum ./panel/
 RUN cd panel && go mod download
 COPY . .
 COPY --from=fe /build/panel/web ./panel/web
-RUN cd panel && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/relay-panel .
+RUN cd panel && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOARM=${TARGETVARIANT#v} go build -trimpath -ldflags="-s -w" -o /out/relay-panel .
 
 # ---------- 运行镜像 ----------
 # 单端口复用：页面 + 面板 API + 节点轮询 API 全部走 PANEL_ADDR（默认 :8081）
 # 反代/Cloudflare：默认 PANEL_TLS=0 由反代终止 TLS；裸跑直连改 PANEL_TLS=1（自动自签）
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+# 根证书直接从构建阶段拷贝：运行镜像里没有 RUN，目标架构无需模拟执行
+COPY --from=be /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=be /out/relay-panel /usr/local/bin/relay-panel
 VOLUME /etc/relay-panel
 EXPOSE 8081
