@@ -135,17 +135,18 @@ def tcp_autotune_limit(name):
 
 
 def backpressure(binary, reverse):
-    # The relay's two sockets autotune, so together they can hold up to
-    # tcp_rmem max + tcp_wmem max. A fixed payload that fits in there is sent
-    # in full without ever blocking, and the test proves nothing. The test's
-    # own sockets are pinned small; the payload is sized past the relay's share.
+    # Three autotuned buffers sit between sendall() and the stalled receiver:
+    # the sender's send buffer, then the relay's receive and send buffers. A
+    # fixed payload that fits in them is sent in full without ever blocking and
+    # the test proves nothing, so size it past their combined ceiling. (Pinning
+    # the sender's SO_SNDBUF instead makes the reverse direction crawl.)
     slack = 4 * 1024 * 1024
-    size = max(8 * 1024 * 1024, tcp_autotune_limit("tcp_rmem") + tcp_autotune_limit("tcp_wmem") + slack)
+    size = max(8 * 1024 * 1024,
+               tcp_autotune_limit("tcp_rmem") + 2 * tcp_autotune_limit("tcp_wmem") + slack)
     payload = bytes(range(256)) * (size // 256 + 1)
     with listener() as upstream:
         process, client, remote = connected_pair(binary, upstream)
         sender, receiver = (remote, client) if reverse else (client, remote)
-        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
         receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
         release = threading.Event()
         try:
@@ -173,7 +174,8 @@ def backpressure(binary, reverse):
                 receiver.sendall(b"reply-after-fin")
                 receiver.shutdown(socket.SHUT_WR)
                 assert read_all(sender) == b"reply-after-fin"
-            print("PASS backpressure", "reverse" if reverse else "forward", flush=True)
+            print("PASS backpressure", "reverse" if reverse else "forward",
+                  f"({len(payload) >> 20} MiB)", flush=True)
         finally:
             release.set()
             client.close()
