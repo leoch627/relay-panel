@@ -126,11 +126,26 @@ def connected_pair(binary, upstream):
         raise
 
 
+def tcp_autotune_limit(name):
+    # Third field of tcp_rmem/tcp_wmem: how far the kernel may grow one socket buffer.
+    try:
+        return int(Path(f"/proc/sys/net/ipv4/{name}").read_text().split()[2])
+    except (OSError, ValueError, IndexError):
+        return 8 * 1024 * 1024
+
+
 def backpressure(binary, reverse):
-    payload = bytes(range(256)) * (32 * 1024)  # 8 MiB, well beyond a pipe/budget.
+    # The relay's two sockets autotune, so together they can hold up to
+    # tcp_rmem max + tcp_wmem max. A fixed payload that fits in there is sent
+    # in full without ever blocking, and the test proves nothing. The test's
+    # own sockets are pinned small; the payload is sized past the relay's share.
+    slack = 4 * 1024 * 1024
+    size = max(8 * 1024 * 1024, tcp_autotune_limit("tcp_rmem") + tcp_autotune_limit("tcp_wmem") + slack)
+    payload = bytes(range(256)) * (size // 256 + 1)
     with listener() as upstream:
         process, client, remote = connected_pair(binary, upstream)
         sender, receiver = (remote, client) if reverse else (client, remote)
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 32768)
         receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 32768)
         release = threading.Event()
         try:
