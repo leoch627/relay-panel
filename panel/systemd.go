@@ -150,11 +150,6 @@ func (m *SystemdManager) RemoveRuleFiles(rules []*Rule, tag string) error {
 
 func (m *SystemdManager) unit(tag string) string { return "tcp-pool@" + tag + ".service" }
 
-func (m *SystemdManager) StartRule(tag string) error {
-	_, _, err := m.run.Run("systemctl", "enable", "--now", m.unit(tag))
-	return err
-}
-
 func (m *SystemdManager) RestartRule(tag string) error {
 	_, _, err := m.run.Run("systemctl", "enable", m.unit(tag))
 	if err != nil {
