@@ -6,7 +6,6 @@ import { cn } from "@/lib/utils";
 
 // shadcn Sheet：基于 Dialog 的侧边抽屉
 const Sheet = SheetPrimitive.Root;
-const SheetClose = SheetPrimitive.Close;
 
 const sheetVariants = cva(
   "fixed z-50 flex flex-col bg-popover text-popover-foreground shadow-2xl transition ease-in-out data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:duration-200 data-[state=open]:duration-300",
@@ -64,4 +63,4 @@ const SheetDescription = React.forwardRef<
 ));
 SheetDescription.displayName = SheetPrimitive.Description.displayName;
 
-export { Sheet, SheetClose, SheetContent, SheetHeader, SheetBody, SheetFooter, SheetTitle, SheetDescription };
+export { Sheet, SheetContent, SheetHeader, SheetBody, SheetFooter, SheetTitle, SheetDescription };
