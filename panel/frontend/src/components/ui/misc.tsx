@@ -15,7 +15,3 @@ export function Meter({ value, className, tone }: { value: number; className?: s
     </div>
   );
 }
-
-export function Kbd({ className, ...props }: React.HTMLAttributes<HTMLElement>) {
-  return <kbd className={cn("rounded border bg-muted px-1.5 py-px font-mono text-[11px] text-muted-foreground", className)} {...props} />;
-}
