@@ -41,7 +41,6 @@ export interface UpdateInfo {
   nodes: UpdateNode[];
 }
 
-export type ApiError = { error: string };
 let onUnauthorized: (() => void) | null = null;
 export function setOnUnauthorized(fn: () => void) { onUnauthorized = fn; }
 
