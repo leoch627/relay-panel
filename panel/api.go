@@ -51,14 +51,6 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
-func (a *API) currentUser(r *http.Request) *User {
-	c, err := r.Cookie("panel_session")
-	if err != nil || c.Value == "" {
-		return nil
-	}
-	return a.store.Auth(c.Value)
-}
-
 func (a *API) requireAuth(w http.ResponseWriter, r *http.Request) (*User, string, bool) {
 	c, err := r.Cookie("panel_session")
 	if err != nil || c.Value == "" {
