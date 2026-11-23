@@ -677,23 +677,3 @@ func (s *Store) RulesOnNode(nodeID int64) []*Rule {
 	}
 	return out
 }
-
-// DeleteRulesByNode 级联删除节点名下规则（本函数不触发 systemd 清理，由调用方负责）。
-func (s *Store) DeleteRulesByNode(nodeID int64) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	kept := s.st.Rules[:0]
-	n := 0
-	for _, x := range s.st.Rules {
-		if x.NodeID == nodeID {
-			n++
-			continue
-		}
-		kept = append(kept, x)
-	}
-	s.st.Rules = kept
-	if n > 0 {
-		_ = s.saveLocked()
-	}
-	return n
-}
